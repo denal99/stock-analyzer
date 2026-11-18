@@ -21,6 +21,7 @@ class StockAnalysisService
 
         $tf = strtoupper(trim($timeframe));
         $tfConfig = match ($tf) {
+            '1M' => ['range' => '10y', 'interval' => '1mo', 'label' => 'Monthly', 'unit' => 'year', 'date_fmt' => 'm/Y'],
             '1W' => ['range' => '5y', 'interval' => '1wk', 'label' => 'Weekly', 'unit' => 'month', 'date_fmt' => 'd/m/Y'],
             '1H' => ['range' => '3mo', 'interval' => '60m', 'label' => '1H Intraday', 'unit' => 'day', 'date_fmt' => 'd/m/Y H:i'],
             default => ['range' => '2y', 'interval' => '1d', 'label' => 'Daily', 'unit' => 'day', 'date_fmt' => 'd/m/Y'],

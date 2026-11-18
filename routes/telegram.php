@@ -37,9 +37,10 @@ $sendAnalysisChart = function (Nutgram $bot, string $ticker, StockAnalysisServic
 
         $riskInt = (int) round($maxRisk);
         $tfKeyboard = InlineKeyboardMarkup::make()->addRow(
+            InlineKeyboardButton::make($tf === '1H' ? '• 1H •' : '1H', callback_data: "tf:{$cleanSym}:1H:{$riskInt}"),
             InlineKeyboardButton::make($tf === '1D' ? '• 1D •' : '1D', callback_data: "tf:{$cleanSym}:1D:{$riskInt}"),
             InlineKeyboardButton::make($tf === '1W' ? '• 1W •' : '1W', callback_data: "tf:{$cleanSym}:1W:{$riskInt}"),
-            InlineKeyboardButton::make($tf === '1H' ? '• 1H •' : '1H', callback_data: "tf:{$cleanSym}:1H:{$riskInt}")
+            InlineKeyboardButton::make($tf === '1M' ? '• 1M •' : '1M', callback_data: "tf:{$cleanSym}:1M:{$riskInt}")
         );
 
         $bot->sendPhoto(
@@ -425,19 +426,19 @@ $bot->onCallbackQueryData('tf:{ticker}:{tf}:{risk}', function (Nutgram $bot, str
 
         $riskInt = (int) round($maxRisk);
         $tfKeyboard = InlineKeyboardMarkup::make()->addRow(
+            InlineKeyboardButton::make($tf === '1H' ? '• 1H •' : '1H', callback_data: "tf:{$cleanSym}:1H:{$riskInt}"),
             InlineKeyboardButton::make($tf === '1D' ? '• 1D •' : '1D', callback_data: "tf:{$cleanSym}:1D:{$riskInt}"),
             InlineKeyboardButton::make($tf === '1W' ? '• 1W •' : '1W', callback_data: "tf:{$cleanSym}:1W:{$riskInt}"),
-            InlineKeyboardButton::make($tf === '1H' ? '• 1H •' : '1H', callback_data: "tf:{$cleanSym}:1H:{$riskInt}")
+            InlineKeyboardButton::make($tf === '1M' ? '• 1M •' : '1M', callback_data: "tf:{$cleanSym}:1M:{$riskInt}")
         );
 
-        $bot->editMessageMedia(
-            media: new \SergiX44\Nutgram\Telegram\Types\Input\InputMediaPhoto(
-                media: InputFile::make($data['chart_path']),
-                caption: $caption,
-                parse_mode: ParseMode::HTML
-            ),
+        $bot->sendPhoto(
+            photo: InputFile::make($data['chart_path']),
+            caption: $caption,
+            parse_mode: ParseMode::HTML,
             reply_markup: $tfKeyboard
         );
+        $bot->answerCallbackQuery();
 
         @unlink($data['chart_path']);
     } catch (\Exception $e) {
