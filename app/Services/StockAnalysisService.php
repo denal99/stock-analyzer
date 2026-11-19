@@ -245,10 +245,19 @@ class StockAnalysisService
             'symbol' => $symbol,
             'price' => $lastClose,
             'change_pct' => $changePct,
+            'ma20' => $lastMa20,
             'ma50' => $lastMa50,
             'ma200' => $lastMa200,
+            'rsi' => $lastRsi,
             'r1' => $metaInfo['r1'] ?? 0,
+            'r2' => $metaInfo['r2'] ?? 0,
+            's1' => $metaInfo['s1'] ?? 0,
+            's2' => $metaInfo['s2'] ?? 0,
             'stoploss' => $metaInfo['stoploss'] ?? 0,
+            'max_risk_rp' => $metaInfo['max_risk_rp'] ?? 0,
+            'rec_lot' => $metaInfo['rec_lot'] ?? 0,
+            'alloc_rp' => $metaInfo['alloc_rp'] ?? 0,
+            'signal' => $metaInfo['signal'] ?? '',
             'vol_ratio' => $metaInfo['vol_ratio'] ?? 0,
             'chart_path' => $chartPath,
         ];
@@ -506,8 +515,26 @@ class StockAnalysisService
                     ],
                     'yPrice' => [
                         'position' => 'right',
-                        'min' => (int) (floor((min(array_column($candles, 'l')) - ((max(array_column($candles, 'h')) - min(array_column($candles, 'l'))) * 0.42)) / 50) * 50),
-                        'max' => (int) (ceil((max(array_column($candles, 'h')) + ((max(array_column($candles, 'h')) - min(array_column($candles, 'l'))) * 0.05)) / 50) * 50),
+                        'min' => (function () use ($candles, $ma200, $meta) {
+                            $lows = array_column($candles, 'l');
+                            $highs = array_column($candles, 'h');
+                            $ma200Vals = array_filter(array_column($ma200, 'y'), fn($v) => $v !== null && $v > 0);
+                            $minVal = min($lows);
+                            $maxVal = max(array_merge($highs, $ma200Vals, [$meta['r1'] ?? 0]));
+                            $range = max(1, $maxVal - $minVal);
+                            $step = $maxVal < 500 ? 10 : ($maxVal < 2000 ? 25 : 50);
+                            return (int) (floor(($minVal - ($range * 0.35)) / $step) * $step);
+                        })(),
+                        'max' => (function () use ($candles, $ma200, $meta) {
+                            $lows = array_column($candles, 'l');
+                            $highs = array_column($candles, 'h');
+                            $ma200Vals = array_filter(array_column($ma200, 'y'), fn($v) => $v !== null && $v > 0);
+                            $minVal = min($lows);
+                            $maxVal = max(array_merge($highs, $ma200Vals, [$meta['r1'] ?? 0]));
+                            $range = max(1, $maxVal - $minVal);
+                            $step = $maxVal < 500 ? 10 : ($maxVal < 2000 ? 25 : 50);
+                            return (int) (ceil(($maxVal + ($range * 0.06)) / $step) * $step);
+                        })(),
                         'grid' => ['color' => '#e2e8f0'],
                         'ticks' => ['font' => ['size' => 11]],
                     ],

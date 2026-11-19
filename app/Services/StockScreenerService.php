@@ -117,6 +117,689 @@ class StockScreenerService
         return array_slice($candidates, 0, $limit);
     }
 
+    public function compareStocks(array $rawSymbols): array
+    {
+        $symbols = array_values(array_unique(array_filter(array_map(function ($s) {
+            $clean = strtoupper(trim(preg_replace('/[^A-Za-z0-9]/', '', $s)));
+            return preg_replace('/JK$/', '', $clean);
+        }, $rawSymbols))));
+
+        $symbols = array_slice($symbols, 0, 5);
+        if (count($symbols) < 2) {
+            throw new Exception('Masukkan minimal 2 kode saham untuk dibandingkan (contoh: /banding BBRI BMRI BBCA BBNI).');
+        }
+
+        $cacheKey = 'idx_compare_v2_' . implode('_', $symbols);
+
+        return Cache::remember($cacheKey, 600, function () use ($symbols) {
+            $auth = $this->getYahooCrumbAndCookie();
+
+            $responses = Http::pool(function (Pool $pool) use ($symbols, $auth) {
+                $requests = [];
+                foreach ($symbols as $sym) {
+                    $ticker = "{$sym}.JK";
+                    $url = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{$ticker}?modules=price,defaultKeyStatistics,summaryDetail,financialData,balanceSheetHistoryQuarterly&crumb=" . urlencode($auth['crumb']);
+
+                    $requests[$sym] = $pool->as($sym)
+                        ->timeout(15)
+                        ->withOptions(['force_ip_resolve' => 'v4'])
+                        ->withHeaders([
+                            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                            'Cookie' => $auth['cookie'],
+                        ])
+                        ->get($url);
+                }
+                return $requests;
+            });
+
+            $results = [];
+
+            foreach ($symbols as $sym) {
+                $res = $responses[$sym] ?? null;
+                if (!$res || $res->failed()) {
+                    continue;
+                }
+
+                $summary = $res->json('quoteSummary.result.0');
+                if (!$summary) {
+                    continue;
+                }
+
+                $price = $summary['price']['regularMarketPrice']['raw'] ?? null;
+                if (!$price) {
+                    continue;
+                }
+
+                $name = $summary['price']['shortName']['raw']
+                    ?? ($summary['price']['shortName'] ?? $sym);
+                $marketCap = $summary['price']['marketCap']['raw'] ?? ($summary['summaryDetail']['marketCap']['raw'] ?? 0);
+                $per = $summary['summaryDetail']['trailingPE']['raw'] ?? ($summary['defaultKeyStatistics']['trailingPE']['raw'] ?? null);
+                $pbv = $summary['defaultKeyStatistics']['priceToBook']['raw'] ?? null;
+
+                if ($per === null && !empty($summary['defaultKeyStatistics']['trailingEps']['raw'])) {
+                    $eps = $summary['defaultKeyStatistics']['trailingEps']['raw'];
+                    if ($eps > 0) {
+                        $per = $price / $eps;
+                    }
+                }
+
+                $rawDer = $summary['financialData']['debtToEquity']['raw'] ?? null;
+                $der = $rawDer !== null ? round($rawDer / 100, 2) : null;
+                if ($der === null) {
+                    $bs = $summary['balanceSheetHistoryQuarterly']['balanceSheetStatements'][0] ?? null;
+                    $totalLiab = $bs['totalLiab']['raw'] ?? null;
+                    $totalEquity = $bs['totalStockholderEquity']['raw'] ?? null;
+                    if ($totalLiab !== null && $totalEquity !== null && $totalEquity > 0) {
+                        $der = round($totalLiab / $totalEquity, 2);
+                    }
+                }
+
+                $rawRoe = $summary['financialData']['returnOnEquity']['raw'] ?? null;
+                $roe = $rawRoe !== null ? round($rawRoe * 100, 2) : null;
+
+                $rawNpm = $summary['financialData']['profitMargins']['raw'] ?? null;
+                $npm = $rawNpm !== null ? round($rawNpm * 100, 2) : null;
+
+                $rawRevGrowth = $summary['financialData']['revenueGrowth']['raw'] ?? null;
+                $revGrowth = $rawRevGrowth !== null ? round($rawRevGrowth * 100, 2) : null;
+
+                $rawEarnGrowth = $summary['financialData']['earningsGrowth']['raw'] ?? null;
+                $earnGrowth = $rawEarnGrowth !== null ? round($rawEarnGrowth * 100, 2) : null;
+
+                $rawDiv = $summary['summaryDetail']['dividendYield']['raw']
+                    ?? ($summary['summaryDetail']['trailingAnnualDividendYield']['raw'] ?? null);
+                $dividendYield = ($rawDiv !== null && $rawDiv > 0) ? round($rawDiv * 100, 2) : null;
+
+                $results[] = [
+                    'symbol' => $sym,
+                    'name' => $name,
+                    'price' => $price,
+                    'market_cap' => $marketCap,
+                    'market_cap_formatted' => $this->formatMarketCap($marketCap),
+                    'per' => $per !== null ? round($per, 2) : null,
+                    'pbv' => $pbv !== null ? round($pbv, 2) : null,
+                    'roe' => $roe,
+                    'npm' => $npm,
+                    'rev_growth' => $revGrowth,
+                    'earn_growth' => $earnGrowth,
+                    'der' => $der,
+                    'dividend_yield' => $dividendYield,
+                    'score' => 0,
+                ];
+            }
+
+            // Relative Peer Scoring (Max 100 poin: PER 20, PBV 15, ROE 25, NPM 15, Growth 15, Dividen 10)
+            $pers = array_filter(array_column($results, 'per'), fn($v) => $v !== null && $v > 0);
+            $minPer = !empty($pers) ? min($pers) : null;
+
+            $pbvs = array_filter(array_column($results, 'pbv'), fn($v) => $v !== null && $v > 0);
+            $minPbv = !empty($pbvs) ? min($pbvs) : null;
+
+            $roes = array_filter(array_column($results, 'roe'), fn($v) => $v !== null && $v > 0);
+            $maxRoe = !empty($roes) ? max($roes) : null;
+
+            $npms = array_filter(array_column($results, 'npm'), fn($v) => $v !== null && $v > 0);
+            $maxNpm = !empty($npms) ? max($npms) : null;
+
+            $earns = array_filter(array_column($results, 'earn_growth'), fn($v) => $v !== null && $v > 0);
+            $maxEarn = !empty($earns) ? max($earns) : null;
+
+            $divs = array_filter(array_column($results, 'dividend_yield'), fn($v) => $v !== null && $v > 0);
+            $maxDiv = !empty($divs) ? max($divs) : null;
+
+            foreach ($results as &$item) {
+                $score = 0;
+                if ($minPer && $item['per'] !== null && $item['per'] > 0) {
+                    $score += ($minPer / $item['per']) * 20;
+                }
+                if ($minPbv && $item['pbv'] !== null && $item['pbv'] > 0) {
+                    $score += ($minPbv / $item['pbv']) * 15;
+                }
+                if ($maxRoe && $item['roe'] !== null && $item['roe'] > 0) {
+                    $score += ($item['roe'] / $maxRoe) * 25;
+                }
+                if ($maxNpm && $item['npm'] !== null && $item['npm'] > 0) {
+                    $score += ($item['npm'] / $maxNpm) * 15;
+                }
+                if ($maxEarn && $item['earn_growth'] !== null && $item['earn_growth'] > 0) {
+                    $score += ($item['earn_growth'] / $maxEarn) * 15;
+                }
+                if ($maxDiv && $item['dividend_yield'] !== null && $item['dividend_yield'] > 0) {
+                    $score += ($item['dividend_yield'] / $maxDiv) * 10;
+                }
+                $item['score'] = (int) round($score);
+            }
+            unset($item);
+
+            usort($results, fn($a, $b) => $b['score'] <=> $a['score']);
+            return $results;
+        });
+    }
+    private function roundToIdxTick(float $price): int
+    {
+        $p = (int) round($price);
+        if ($p < 200) {
+            return (int) (round($p / 1) * 1);
+        } elseif ($p < 500) {
+            return (int) (round($p / 2) * 2);
+        } elseif ($p < 2000) {
+            return (int) (round($p / 5) * 5);
+        } elseif ($p < 5000) {
+            return (int) (round($p / 10) * 10);
+        }
+        return (int) (round($p / 25) * 25);
+    }
+
+    public function calculateValuation(string $rawSymbol): array
+    {
+        $sym = preg_replace('/JK$/', '', strtoupper(trim(preg_replace('/[^A-Za-z0-9]/', '', $rawSymbol))));
+        if (strlen($sym) < 4) {
+            throw new Exception('Kode saham tidak valid (contoh: /valuasi BBRI).');
+        }
+
+        return Cache::remember("idx_valuasi_v6_{$sym}", 600, function () use ($sym) {
+            $auth = $this->getYahooCrumbAndCookie();
+            $ticker = "{$sym}.JK";
+            $url = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{$ticker}?modules=price,assetProfile,defaultKeyStatistics,summaryDetail,financialData,cashflowStatementHistory,incomeStatementHistory&crumb=" . urlencode($auth['crumb']);
+
+            $res = Http::timeout(15)
+                ->withOptions(['force_ip_resolve' => 'v4'])
+                ->withHeaders([
+                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    'Cookie' => $auth['cookie'],
+                ])
+                ->get($url);
+
+            if ($res->failed()) {
+                throw new Exception("Gagal mengambil data {$sym} dari Yahoo Finance.");
+            }
+
+            $summary = $res->json('quoteSummary.result.0');
+            $price = $summary['price']['regularMarketPrice']['raw'] ?? null;
+            if (!$summary || !$price) {
+                throw new Exception("Data emiten {$sym} tidak ditemukan.");
+            }
+
+            $name = $summary['price']['shortName']['raw'] ?? ($summary['price']['shortName'] ?? $sym);
+            $sector = $summary['assetProfile']['sector'] ?? '';
+            $isFinancial = stripos($sector, 'Financial') !== false || in_array($sym, ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'BBTN', 'BRIS', 'BNGA', 'BDMN', 'NISP', 'BJBR', 'BJTM', 'ARTO', 'BBYB', 'BTPS']);
+
+            $shares = $summary['defaultKeyStatistics']['sharesOutstanding']['raw'] ?? null;
+            $marketCap = $summary['price']['marketCap']['raw'] ?? ($shares ? $price * $shares : null);
+            if (!$shares && $marketCap && $price > 0) {
+                $shares = $marketCap / $price;
+            }
+
+            $eps = $summary['defaultKeyStatistics']['trailingEps']['raw'] ?? null;
+            $tradeCurrency = strtoupper($summary['price']['currency'] ?? 'IDR');
+            $finCurrency = strtoupper($summary['financialData']['financialCurrency'] ?? $tradeCurrency);
+            $fxRate = ($tradeCurrency === 'IDR' && $finCurrency === 'USD') ? $this->getUsdToIdrRate() : 1.0;
+
+            $bvps = $summary['defaultKeyStatistics']['bookValue']['raw'] ?? null;
+            if ($bvps !== null) {
+                $bvps *= $fxRate;
+            }
+            $per = $summary['summaryDetail']['trailingPE']['raw'] ?? ($eps && $eps > 0 ? $price / $eps : null);
+            $pbv = ($fxRate > 1.0 && $bvps && $bvps > 0) ? ($price / $bvps) : ($summary['defaultKeyStatistics']['priceToBook']['raw'] ?? ($bvps && $bvps > 0 ? $price / $bvps : null));
+            $roe = $summary['financialData']['returnOnEquity']['raw'] ?? (($eps && $bvps && $bvps > 0) ? ($eps / $bvps) : null);
+            $divRate = $summary['summaryDetail']['dividendRate']['raw'] ?? ($summary['summaryDetail']['trailingAnnualDividendRate']['raw'] ?? null);
+
+            if ($isFinancial) {
+                // Model Khusus Sektor Perbankan & Keuangan (Kalibrasi Konservatif)
+                $costOfEquity = 0.12; // 12% cost of equity perbankan IDX
+                $stableGrowth = 0.05; // 5% pertumbuhan jangka panjang
+
+                // 1. Justified PBV = (ROE - g) / (r - g) * BVPS
+                $m1Label = 'Justified PBV (Excess Return)';
+                $m1Price = null;
+                if ($roe !== null && $roe > $stableGrowth && $bvps !== null && $bvps > 0) {
+                    $justifiedPbv = min(4.0, max(0.8, ($roe - $stableGrowth) / ($costOfEquity - $stableGrowth)));
+                    $m1Price = $this->roundToIdxTick($justifiedPbv * $bvps);
+                }
+
+                // 2. Gordon Growth / Dividend Discount Model (DDM) = D1 / (r - g)
+                $m2Label = 'Dividend Discount (DDM)';
+                $m2Price = null;
+                $sustainableDiv = null;
+                if ($divRate !== null && $divRate > 0) {
+                    // Batasi dividen berkelanjutan maksimal 70% EPS agar dividen spesial tidak mendistorsi DDM
+                    $sustainableDiv = ($eps !== null && $eps > 0) ? min($divRate, $eps * 0.70) : $divRate;
+                } elseif ($eps !== null && $eps > 0) {
+                    $sustainableDiv = $eps * 0.50;
+                }
+                if ($sustainableDiv !== null && $sustainableDiv > 0) {
+                    $rawDdm = ($sustainableDiv * (1 + $stableGrowth)) / ($costOfEquity - $stableGrowth);
+                    $m2Price = $this->roundToIdxTick(min($rawDdm, $price * 2.0));
+                }
+
+                // 3. Fair Forward Earnings Multiple (15x EPS untuk bank kualitas tinggi ROE >= 15%, 12x untuk lainnya)
+                $m3Label = 'Bank Fair Multiple (PER)';
+                $m3Price = null;
+                if ($eps !== null && $eps > 0) {
+                    $fairPe = ($roe !== null && $roe >= 0.18) ? 16.0 : (($roe !== null && $roe >= 0.12) ? 13.0 : 10.5);
+                    $m3Price = $this->roundToIdxTick($eps * $fairPe);
+                }
+            } else {
+                // Model Non-Bank (Manufaktur, Komoditas, Konsumer, Telko, dll.)
+                // 1. Graham Number = sqrt(22.5 * EPS * BVPS)
+                $m1Label = 'Graham Number';
+                $m1Price = null;
+                if ($eps !== null && $eps > 0 && $bvps !== null && $bvps > 0) {
+                    $m1Price = $this->roundToIdxTick(sqrt(22.5 * $eps * $bvps));
+                }
+
+                // 2. Earnings Power Value (EPV) = EPS / Cost of Equity (10%)
+                $m2Label = 'Earnings Power (EPV)';
+                $m2Price = null;
+                if ($eps !== null && $eps > 0) {
+                    $m2Price = $this->roundToIdxTick($eps / 0.10);
+                }
+
+                // Fallback Book Value jika EPS negatif sehingga Graham & EPV N/A
+                if ($m1Price === null && $m2Price === null && $bvps !== null && $bvps > 0) {
+                    $m1Label = 'Nilai Buku (1.0x BVPS)';
+                    $m1Price = $this->roundToIdxTick($bvps);
+                }
+
+                // 3. DCF 5-Year Model (Discount Rate 10%, Terminal Growth 3%)
+                $m3Label = 'DCF 5-Tahun';
+                $m3Price = null;
+                $cfStmt = $summary['cashflowStatementHistory']['cashflowStatements'][0] ?? null;
+                $ocf = $cfStmt['totalCashFromOperatingActivities']['raw'] ?? null;
+                $capex = abs($cfStmt['capitalExpenditures']['raw'] ?? 0);
+
+                $fcf = null;
+                if ($ocf !== null && ($ocf - $capex) > 0) {
+                    $fcf = $ocf - $capex;
+                } else {
+                    $rawFcf = $summary['financialData']['freeCashflow']['raw'] ?? null;
+                    if ($rawFcf !== null && $rawFcf > 0) {
+                        $fcf = $rawFcf;
+                    } elseif ($ocf !== null && $ocf > 0) {
+                        $fcf = $ocf * 0.50;
+                    }
+                }
+
+                if ($fcf !== null && $fcf > 0 && $shares && $shares > 0) {
+                    $fcf *= $fxRate;
+                    // Batasi FCF yield maksimal 15% dari Market Cap agar tidak terdistorsi anomali kas 1 tahun
+                    if ($marketCap && $marketCap > 0) {
+                        $fcf = min($fcf, $marketCap * 0.15);
+                    }
+
+                    $rawGrowth = $summary['financialData']['earningsGrowth']['raw']
+                        ?? ($summary['financialData']['revenueGrowth']['raw'] ?? 0.06);
+                    $g = max(0.03, min(0.12, (float) $rawGrowth));
+                    $r = 0.105;
+                    $tg = 0.03;
+
+                    $pvSum = 0.0;
+                    $projectedFcf = $fcf;
+                    for ($yr = 1; $yr <= 5; $yr++) {
+                        $projectedFcf *= (1 + $g);
+                        $pvSum += $projectedFcf / pow(1 + $r, $yr);
+                    }
+
+                    $terminalVal = ($projectedFcf * (1 + $tg)) / ($r - $tg);
+                    $pvTerminal = $terminalVal / pow(1 + $r, 5);
+
+                    $totalCash = ($summary['financialData']['totalCash']['raw'] ?? 0) * $fxRate;
+                    $totalDebt = ($summary['financialData']['totalDebt']['raw'] ?? 0) * $fxRate;
+                    $equityVal = $pvSum + $pvTerminal + $totalCash - $totalDebt;
+
+                    if ($equityVal > 0) {
+                        // Sanity cap: DCF per saham maksimal 2.5x harga pasar saat ini
+                        $rawDcfPrice = min($equityVal / $shares, $price * 2.5);
+                        $m3Price = $this->roundToIdxTick($rawDcfPrice);
+                    }
+                }
+            }
+
+            // Konsensus Nilai Wajar
+            $estimates = array_filter([$m1Price, $m2Price, $m3Price], fn($v) => $v !== null && $v > 0);
+            if (empty($estimates)) {
+                throw new Exception("Laba/Arus kas {$sym} masih negatif sehingga nilai wajar intrinsik belum dapat dihitung.");
+            }
+
+            $fairValue = $this->roundToIdxTick(array_sum($estimates) / count($estimates));
+            $mos = round((($fairValue - $price) / $fairValue) * 100, 2);
+            $upside = round((($fairValue - $price) / $price) * 100, 2);
+
+            if ($mos >= 25) {
+                $verdict = '🟢 UNDERVALUED (Margin of Safety Tebal)';
+            } elseif ($mos >= 5) {
+                $verdict = '🟡 LAYAK KOLEKSI (Terdiskon Tipis)';
+            } elseif ($mos >= -10) {
+                $verdict = '⚪ FAIRLY VALUED (Harga Wajar)';
+            } else {
+                $verdict = '🔴 OVERVALUED (Harga di Atas Nilai Wajar)';
+            }
+
+            return [
+                'symbol' => $sym,
+                'name' => $name,
+                'is_financial' => $isFinancial,
+                'price' => $price,
+                'eps' => $eps !== null ? round($eps, 2) : null,
+                'bvps' => $bvps !== null ? round($bvps, 2) : null,
+                'per' => $per !== null ? round($per, 2) : null,
+                'pbv' => $pbv !== null ? round($pbv, 2) : null,
+                'm1_label' => $m1Label,
+                'm1_price' => $m1Price,
+                'm2_label' => $m2Label,
+                'm2_price' => $m2Price,
+                'm3_label' => $m3Label,
+                'm3_price' => $m3Price,
+                'fair_value' => $fairValue,
+                'mos' => $mos,
+                'upside' => $upside,
+                'verdict' => $verdict,
+            ];
+        });
+    }
+    public function auditFundamentals(string $rawSymbol): array
+    {
+        $sym = preg_replace('/JK$/', '', strtoupper(trim(preg_replace('/[^A-Za-z0-9]/', '', $rawSymbol))));
+        if (strlen($sym) < 4) {
+            throw new Exception('Kode saham tidak valid (contoh: /audit ASII).');
+        }
+
+        return Cache::remember("idx_audit_v2_{$sym}", 600, function () use ($sym) {
+            $auth = $this->getYahooCrumbAndCookie();
+            $ticker = "{$sym}.JK";
+            $url = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{$ticker}?modules=price,assetProfile,financialData,defaultKeyStatistics,incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory&crumb=" . urlencode($auth['crumb']);
+
+            $res = Http::timeout(15)
+                ->withOptions(['force_ip_resolve' => 'v4'])
+                ->withHeaders([
+                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    'Cookie' => $auth['cookie'],
+                ])
+                ->get($url);
+
+            if ($res->failed()) {
+                throw new Exception("Gagal mengambil laporan keuangan {$sym}.");
+            }
+
+            $summary = $res->json('quoteSummary.result.0');
+            $price = $summary['price']['regularMarketPrice']['raw'] ?? null;
+            if (!$summary || !$price) {
+                throw new Exception("Data emiten {$sym} tidak ditemukan.");
+            }
+
+            $name = $summary['price']['shortName']['raw'] ?? ($summary['price']['shortName'] ?? $sym);
+            $sector = $summary['assetProfile']['sector'] ?? '';
+            $isFinancial = stripos($sector, 'Financial') !== false || in_array($sym, ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'BBTN', 'BRIS', 'BNGA', 'BDMN', 'NISP', 'BJBR', 'BJTM', 'ARTO', 'BBYB', 'BTPS']);
+
+            $fin = $summary['financialData'] ?? [];
+            $stats = $summary['defaultKeyStatistics'] ?? [];
+            $inc = $summary['incomeStatementHistory']['incomeStatementHistory'] ?? [];
+            $bal = $summary['balanceSheetHistory']['balanceSheetStatements'] ?? [];
+            $cf = $summary['cashflowStatementHistory']['cashflowStatements'] ?? [];
+
+            $hasFullHistory = (count($inc) >= 2 && count($bal) >= 2 && ($bal[0]['totalAssets']['raw'] ?? 0) > 0);
+
+            if ($hasFullHistory) {
+                $ni0 = $inc[0]['netIncome']['raw'] ?? 0;
+                $ni1 = $inc[1]['netIncome']['raw'] ?? 0;
+                $rev0 = $inc[0]['totalRevenue']['raw'] ?? 0;
+                $rev1 = $inc[1]['totalRevenue']['raw'] ?? 0;
+                $gp0 = $inc[0]['grossProfit']['raw'] ?? null;
+                $gp1 = $inc[1]['grossProfit']['raw'] ?? null;
+
+                $ta0 = $bal[0]['totalAssets']['raw'] ?? 0;
+                $ta1 = $bal[1]['totalAssets']['raw'] ?? 0;
+                $ltd0 = $bal[0]['longTermDebt']['raw'] ?? 0;
+                $ltd1 = $bal[1]['longTermDebt']['raw'] ?? 0;
+                $ca0 = $bal[0]['totalCurrentAssets']['raw'] ?? null;
+                $cl0 = $bal[0]['totalCurrentLiabilities']['raw'] ?? null;
+                $ca1 = $bal[1]['totalCurrentAssets']['raw'] ?? null;
+                $cl1 = $bal[1]['totalCurrentLiabilities']['raw'] ?? null;
+                $shares0 = $bal[0]['commonStock']['raw'] ?? null;
+                $shares1 = $bal[1]['commonStock']['raw'] ?? null;
+
+                $ocf0 = $cf[0]['totalCashFromOperatingActivities']['raw'] ?? ($fin['operatingCashflow']['raw'] ?? 0);
+                $roa0 = ($ta0 > 0) ? ($ni0 / $ta0) : ($fin['returnOnAssets']['raw'] ?? 0);
+                $roa1 = ($ta1 > 0) ? ($ni1 / $ta1) : 0;
+
+                $c1 = $roa0 > 0;
+                $c2 = $ocf0 > 0;
+                $c3 = $roa0 > $roa1;
+                $c4 = $ocf0 > $ni0;
+
+                $lev0 = ($ta0 > 0) ? ($ltd0 / $ta0) : 0;
+                $lev1 = ($ta1 > 0) ? ($ltd1 / $ta1) : 0;
+                $c5 = $lev0 <= $lev1;
+
+                if ($ca0 !== null && $cl0 > 0 && $ca1 !== null && $cl1 > 0) {
+                    $c6 = ($ca0 / $cl0) > ($ca1 / $cl1);
+                    $c6Note = 'Current Ratio meningkat';
+                } else {
+                    $eq0 = $bal[0]['totalStockholderEquity']['raw'] ?? 0;
+                    $eq1 = $bal[1]['totalStockholderEquity']['raw'] ?? 0;
+                    $c6 = ($ta0 > 0 && $ta1 > 0) ? (($eq0 / $ta0) >= ($eq1 / $ta1)) : true;
+                    $c6Note = 'Rasio Permodalan stabil/naik';
+                }
+
+                $c7 = ($shares0 === null || $shares1 === null) ? true : ($shares0 <= $shares1);
+
+                if ($gp0 !== null && $rev0 > 0 && $gp1 !== null && $rev1 > 0) {
+                    $c8 = ($gp0 / $rev0) > ($gp1 / $rev1);
+                    $c8Note = 'Gross Margin meningkat';
+                } else {
+                    $c8 = ($rev0 > 0 && $rev1 > 0) ? (($ni0 / $rev0) > ($ni1 / $rev1)) : false;
+                    $c8Note = 'Net Margin meningkat';
+                }
+
+                $at0 = ($ta0 > 0) ? ($rev0 / $ta0) : 0;
+                $at1 = ($ta1 > 0) ? ($rev1 / $ta1) : 0;
+                $c9 = $at0 > $at1;
+            } else {
+                // Fallback cerdas menggunakan data TTM (financialData & defaultKeyStatistics)
+                $roa0 = $fin['returnOnAssets']['raw'] ?? 0;
+                $roe0 = $fin['returnOnEquity']['raw'] ?? 0;
+                $ocf0 = $fin['operatingCashflow']['raw'] ?? 0;
+                $ni0 = $stats['netIncomeToCommon']['raw'] ?? 0;
+                $earnGrowth = $fin['earningsGrowth']['raw'] ?? 0;
+                $revGrowth = $fin['revenueGrowth']['raw'] ?? 0;
+                $npm = $fin['profitMargins']['raw'] ?? 0;
+                $gm = $fin['grossMargins']['raw'] ?? 0;
+                $cr = $fin['currentRatio']['raw'] ?? null;
+                $der = $fin['debtToEquity']['raw'] ?? null;
+
+                $c1 = $roa0 > 0;
+                $c2 = $isFinancial ? ($ni0 > 0) : ($ocf0 > 0);
+                $c3 = $earnGrowth > 0;
+                $c4 = $isFinancial ? ($roe0 >= 0.12) : ($ni0 > 0 && $ocf0 >= $ni0 * 0.8);
+                $c5 = ($der === null) ? true : ($der <= 150);
+                $c6 = ($cr === null) ? ($roe0 >= 0.10) : ($cr >= 1.0);
+                $c6Note = ($cr === null) ? 'Solvabilitas & Permodalan sehat' : 'Current Ratio sehat (' . round($cr, 2) . 'x)';
+                $c7 = true;
+                $c8 = ($gm > 0.20 || $npm > 0.10);
+                $c8Note = $isFinancial ? 'Net Profit Margin kuat (' . round($npm * 100, 1) . '%)' : 'Margin Laba sehat';
+                $c9 = $revGrowth > 0;
+            }
+
+            // Cash Conversion Ratio (CCR)
+            if ($isFinancial) {
+                $ccr = ($ni0 > 0 && $ocf0 > 0) ? round($ocf0 / $ni0, 2) : null;
+                $ccrStatus = 'ℹ️ Sektor Keuangan/Bank (OCF dipengaruhi penyaluran kredit)';
+            } elseif ($ni0 <= 0) {
+                $ccr = null;
+                $ccrStatus = '🔴 Rugi Bersih (Negatif)';
+            } elseif ($ocf0 > 0) {
+                $ccr = round($ocf0 / $ni0, 2);
+                if ($ccr >= 1.0) {
+                    $ccrStatus = '🟢 Sangat Sehat (Laba 100% Tunai)';
+                } elseif ($ccr >= 0.8) {
+                    $ccrStatus = '🟡 Wajar (Konversi Kas Baik)';
+                } else {
+                    $ccrStatus = '⚠️ Waspada Laba Kertas (OCF &lt; 80% Laba)';
+                }
+            } else {
+                $ccr = null;
+                $ccrStatus = 'ℹ️ Data arus kas operasi TTM tidak tersedia';
+            }
+
+            $checks = [
+                ['pass' => $c1, 'label' => 'ROA Positif (' . round($roa0 * 100, 2) . '%)'],
+                ['pass' => $c2, 'label' => $isFinancial ? 'Laba Operasi & Bersih Positif' : 'Arus Kas Operasi (OCF) Positif'],
+                ['pass' => $c3, 'label' => 'Profitabilitas / Laba Tumbuh YoY'],
+                ['pass' => $c4, 'label' => $isFinancial ? 'Efisiensi Ekuitas Tinggi (ROE &gt;= 12%)' : 'Kualitas Laba Tunai (OCF &gt;= Laba)'],
+                ['pass' => $c5, 'label' => 'Rasio Utang Terkendali'],
+                ['pass' => $c6, 'label' => $c6Note],
+                ['pass' => $c7, 'label' => 'Tanpa Dilusi Saham Baru'],
+                ['pass' => $c8, 'label' => $c8Note],
+                ['pass' => $c9, 'label' => 'Pertumbuhan Pendapatan / Turnover Positif'],
+            ];
+
+            $fScore = count(array_filter($checks, fn($c) => $c['pass']));
+
+            if ($fScore >= 7) {
+                $fVerdict = '🟢 FUNDAMENTAL SANGAT KUAT (Institutional Grade)';
+            } elseif ($fScore >= 4) {
+                $fVerdict = '🟡 FUNDAMENTAL MODERAT / STABIL';
+            } else {
+                $fVerdict = '🔴 FUNDAMENTAL LEMAH / BERISIKO';
+            }
+
+            return [
+                'symbol' => $sym,
+                'name' => $name,
+                'price' => $price,
+                'ccr' => $ccr,
+                'ccr_status' => $ccrStatus,
+                'f_score' => $fScore,
+                'f_verdict' => $fVerdict,
+                'checks' => $checks,
+            ];
+        });
+    }
+    public function getSectorRotation(): array
+    {
+        return Cache::remember('idx_sector_rotation_v1', 300, function () {
+            $sectors = [
+                '🏦 Perbankan & Keuangan' => ['BBCA', 'BBRI', 'BMRI', 'BBNI'],
+                '⛏️ Energi & Batu Bara' => ['ADRO', 'PTBA', 'ITMG', 'PGAS'],
+                '🪨 Tambang Mineral & Metal' => ['ANTM', 'INCO', 'MDKA', 'AMMN'],
+                '🛒 Konsumer & Ritel' => ['ICBP', 'INDF', 'KLBF', 'AMRT'],
+                '📡 Telko & Infrastruktur' => ['TLKM', 'ISAT', 'EXCL', 'JSMR'],
+                '🏢 Properti & Konstruksi' => ['BSDE', 'PWON', 'CTRA', 'SMRA'],
+                '🏭 Industri & Otomotif' => ['ASII', 'UNTR', 'SMGR', 'INTP'],
+                '🌴 Agribisnis & CPO' => ['AALI', 'LSIP', 'TAPG', 'DSNG'],
+            ];
+
+            $allTickers = [];
+            foreach ($sectors as $list) {
+                foreach ($list as $sym) {
+                    $allTickers[$sym] = true;
+                }
+            }
+            $symbols = array_keys($allTickers);
+
+            $responses = Http::pool(function (Pool $pool) use ($symbols) {
+                $requests = [];
+                foreach ($symbols as $sym) {
+                    $url = "https://query1.finance.yahoo.com/v8/finance/chart/{$sym}.JK?range=2mo&interval=1d";
+                    $requests[$sym] = $pool->as($sym)
+                        ->timeout(12)
+                        ->withOptions(['force_ip_resolve' => 'v4'])
+                        ->withHeaders([
+                            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                        ])
+                        ->get($url);
+                }
+                return $requests;
+            });
+
+            $perfMap = [];
+            foreach ($symbols as $sym) {
+                $res = $responses[$sym] ?? null;
+                if (!$res || $res->failed()) {
+                    continue;
+                }
+
+                $result = $res->json('chart.result.0');
+                $closes = $result['indicators']['quote'][0]['close'] ?? [];
+                $closes = array_values(array_filter($closes, fn($v) => $v !== null && $v > 0));
+                $cnt = count($closes);
+
+                if ($cnt < 6) {
+                    continue;
+                }
+
+                $last = $closes[$cnt - 1];
+                $prev1d = $closes[$cnt - 2];
+                $prev1w = $closes[max(0, $cnt - 6)];
+                $prev1m = $closes[max(0, $cnt - 21)];
+
+                $chg1d = (($last - $prev1d) / $prev1d) * 100;
+                $chg1w = (($last - $prev1w) / $prev1w) * 100;
+                $chg1m = (($last - $prev1m) / $prev1m) * 100;
+
+                $perfMap[$sym] = [
+                    'symbol' => $sym,
+                    'price' => $last,
+                    'chg_1d' => round($chg1d, 2),
+                    'chg_1w' => round($chg1w, 2),
+                    'chg_1m' => round($chg1m, 2),
+                    'score' => ($chg1d * 0.40) + ($chg1w * 0.35) + ($chg1m * 0.25),
+                ];
+            }
+
+            $sectorResults = [];
+            foreach ($sectors as $sectorName => $members) {
+                $validMembers = [];
+                foreach ($members as $sym) {
+                    if (isset($perfMap[$sym])) {
+                        $validMembers[] = $perfMap[$sym];
+                    }
+                }
+
+                if (empty($validMembers)) {
+                    continue;
+                }
+
+                $avg1d = round(array_sum(array_column($validMembers, 'chg_1d')) / count($validMembers), 2);
+                $avg1w = round(array_sum(array_column($validMembers, 'chg_1w')) / count($validMembers), 2);
+                $avg1m = round(array_sum(array_column($validMembers, 'chg_1m')) / count($validMembers), 2);
+                // Urutkan anggota sektor berdasarkan performa terbaik (1D + 1W)
+                usort($validMembers, fn($a, $b) => ($b['chg_1d'] + $b['chg_1w']) <=> ($a['chg_1d'] + $a['chg_1w']));
+                $leader = $validMembers[0];
+
+                // Tentukan fase rotasi sektor (RRG-style) & bonus prioritas fase aktif
+                if ($avg1d > 0 && $avg1w > 0 && $avg1m >= 0) {
+                    $phase = '🚀 LEADING (Inflow Kuat)';
+                    $phaseBonus = 3.0;
+                } elseif ($avg1d > 0 && $avg1w > 0 && $avg1m < 0) {
+                    $phase = '🌱 IMPROVING (Mulai Akumulasi)';
+                    $phaseBonus = 2.0;
+                } elseif ($avg1m > 0 && ($avg1d < 0 || $avg1w < 0)) {
+                    $phase = '⚠️ WEAKENING (Profit Taking)';
+                    $phaseBonus = 0.0;
+                } else {
+                    $phase = '🔻 LAGGING (Outflow / Tertekan)';
+                    $phaseBonus = -2.0;
+                }
+
+                $momentumScore = round(($avg1d * 0.55) + ($avg1w * 0.35) + ($avg1m * 0.10) + $phaseBonus, 2);
+
+                $sectorResults[] = [
+                    'sector' => $sectorName,
+                    'avg_1d' => $avg1d,
+                    'avg_1w' => $avg1w,
+                    'avg_1m' => $avg1m,
+                    'momentum' => $momentumScore,
+                    'phase' => $phase,
+                    'leader' => $leader,
+                    'members' => $validMembers,
+                ];
+            }
+
+            usort($sectorResults, fn($a, $b) => $b['momentum'] <=> $a['momentum']);
+            return $sectorResults;
+        });
+    }
     private function getWatchlistPriceVolume(): array
     {
         return Cache::remember('idx_watchlist_price_vol_v2', 300, function () {
@@ -488,5 +1171,140 @@ class StockScreenerService
             return number_format($cap / 1_000_000_000, 2) . ' M';
         }
         return number_format($cap);
+    }
+
+    public function scanIntradayRadar(): array
+    {
+        return Cache::remember('idx_intraday_radar_v4', 180, function () {
+            $universe = [
+                'BBCA', 'BBRI', 'BMRI', 'BBNI', 'BRIS',
+                'ADRO', 'PTBA', 'ITMG', 'PGAS', 'MEDC',
+                'ANTM', 'INCO', 'MDKA', 'AMMN',
+                'TLKM', 'ISAT', 'EXCL', 'ASII', 'UNTR', 'AMRT',
+            ];
+
+            $responses = Http::pool(function (Pool $pool) use ($universe) {
+                $reqs = [];
+                foreach ($universe as $sym) {
+                    $url = "https://query1.finance.yahoo.com/v8/finance/chart/{$sym}.JK?range=5d&interval=15m";
+                    $reqs[$sym] = $pool->as($sym)
+                        ->connectTimeout(4)
+                        ->timeout(7)
+                        ->withOptions(['force_ip_resolve' => 'v4'])
+                        ->withHeaders([
+                            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                        ])
+                        ->get($url);
+                }
+                return $reqs;
+            });
+
+            $candidates = [];
+
+            foreach ($universe as $sym) {
+                $res = $responses[$sym] ?? null;
+                if (!$res || $res instanceof \Throwable || $res->failed()) {
+                    continue;
+                }
+
+                $result = $res->json('chart.result.0');
+                $meta = $result['meta'] ?? [];
+                $timestamps = $result['timestamp'] ?? [];
+                $quote = $result['indicators']['quote'][0] ?? [];
+
+                $opens = $quote['open'] ?? [];
+                $highs = $quote['high'] ?? [];
+                $lows = $quote['low'] ?? [];
+                $closes = $quote['close'] ?? [];
+                $volumes = $quote['volume'] ?? [];
+
+                $candles = [];
+                $count = count($closes);
+                for ($i = 0; $i < $count; $i++) {
+                    if (
+                        isset($closes[$i], $volumes[$i]) &&
+                        $closes[$i] > 0 && $volumes[$i] > 0
+                    ) {
+                        $candles[] = [
+                            't' => $timestamps[$i] ?? null,
+                            'o' => (float) ($opens[$i] ?? $closes[$i]),
+                            'h' => (float) ($highs[$i] ?? $closes[$i]),
+                            'l' => (float) ($lows[$i] ?? $closes[$i]),
+                            'c' => (float) $closes[$i],
+                            'v' => (float) $volumes[$i],
+                        ];
+                    }
+                }
+
+                $n = count($candles);
+                if ($n < 16) {
+                    continue;
+                }
+
+                $last = $candles[$n - 1];
+                $prev = $candles[$n - 2];
+
+                $lookback = min(20, $n - 1);
+                $volSlice = array_slice($candles, $n - 1 - $lookback, $lookback);
+                $avgVol = array_sum(array_column($volSlice, 'v')) / $lookback;
+                if ($avgVol <= 0) {
+                    continue;
+                }
+
+                $volRatio = round($last['v'] / $avgVol, 2);
+                $range = $last['h'] - $last['l'];
+                $clv = $range > 0 ? round((($last['c'] - $last['l']) / $range) * 100, 0) : ($last['c'] > $prev['c'] ? 100 : ($last['c'] < $prev['c'] ? 0 : 50));
+
+                $candleChg = round((($last['c'] - $prev['c']) / $prev['c']) * 100, 2);
+                $prevDayClose = $meta['chartPreviousClose'] ?? ($meta['previousClose'] ?? $prev['c']);
+                $dayChg = $prevDayClose > 0 ? round((($last['c'] - $prevDayClose) / $prevDayClose) * 100, 2) : $candleChg;
+
+                if ($volRatio >= 2.5 && $clv >= 70 && $candleChg >= 0) {
+                    $tag = '🔥 AGGRESSIVE SWEEP (Haka Kuat)';
+                } elseif ($volRatio >= 1.5 && $candleChg >= 0) {
+                    $tag = '⚡ UNUSUAL VOLUME SPIKE';
+                } elseif ($volRatio >= 1.5 && $candleChg < 0) {
+                    $tag = '⚠️ INTRADAY DISTRIBUTION / FLUSH';
+                } elseif ($candleChg > 0) {
+                    $tag = '📈 INTRADAY ACCUMULATION';
+                } else {
+                    $tag = '👀 ACTIVE CLOSING / FLOW';
+                }
+
+                $score = ($volRatio * 25) + ($clv * 0.3) + (abs($candleChg) * 5);
+
+                $candidates[] = [
+                    'symbol' => $sym,
+                    'price' => $last['c'],
+                    'candle_chg' => $candleChg,
+                    'day_chg' => $dayChg,
+                    'vol_ratio' => $volRatio,
+                    'clv' => $clv,
+                    'tag' => $tag,
+                    'score' => $score,
+                ];
+            }
+
+            usort($candidates, fn($a, $b) => $b['score'] <=> $a['score']);
+            return array_slice($candidates, 0, 8);
+        });
+    }
+
+    protected function getUsdToIdrRate(): float
+    {
+        return Cache::remember('fx_usdidr_rate', 3600, function () {
+            try {
+                $res = Http::timeout(8)
+                    ->withOptions(['force_ip_resolve' => 'v4'])
+                    ->withHeaders(['User-Agent' => 'Mozilla/5.0'])
+                    ->get('https://query1.finance.yahoo.com/v8/finance/chart/USDIDR=X?interval=1d&range=1d');
+                $rate = $res->json('chart.result.0.meta.regularMarketPrice');
+                if ($rate && $rate > 10000) {
+                    return (float) $rate;
+                }
+            } catch (\Throwable $e) {
+            }
+            return 16200.0;
+        });
     }
 }
