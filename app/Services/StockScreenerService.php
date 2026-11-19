@@ -1307,4 +1307,256 @@ class StockScreenerService
             return 16200.0;
         });
     }
+
+    public function getStockbitToken(): ?string
+    {
+        return Cache::get('stockbit_bearer_token') ?: env('STOCKBIT_BEARER_TOKEN');
+    }
+
+    public function scanTopRetailSell(array $tickers, int $limit = 18, ?string $fromDate = null, ?string $toDate = null): array
+    {
+        $token = $this->getStockbitToken();
+        if (empty($token)) {
+            return ['error' => 'NO_TOKEN'];
+        }
+
+        $retailBrokers = ['YP', 'XC', 'XL', 'PD', 'KK', 'NI', 'SQ', 'CC', 'GR', 'EP', 'DR', 'LG'];
+        $today = now()->timezone('Asia/Jakarta')->format('Y-m-d');
+        $from = $fromDate ?: $today;
+        $to   = $toDate ?: $from;
+
+        $cleanTickers = array_values(array_unique(array_map(
+            fn($t) => str_replace('.JK', '', strtoupper(trim($t))),
+            $tickers
+        )));
+
+        $sbResponses = [];
+        foreach (array_chunk($cleanTickers, 4) as $chunk) {
+            $batch = Http::pool(function (\Illuminate\Http\Client\Pool $pool) use ($chunk, $token, $from, $to) {
+                foreach ($chunk as $sym) {
+                    $pool->as($sym)
+                        ->withToken($token)
+                        ->withOptions(['force_ip_resolve' => 'v4'])
+                        ->withHeaders([
+                            'Origin'     => 'https://stockbit.com',
+                            'Referer'    => 'https://stockbit.com/',
+                            'User-Agent' => 'Mozilla/5.0',
+                        ])
+                        ->connectTimeout(5)
+                        ->timeout(8)
+                        ->get("https://exodus.stockbit.com/marketdetectors/{$sym}", [
+                            'from'             => $from,
+                            'to'               => $to,
+                            'transaction_type' => 'TRANSACTION_TYPE_NET',
+                            'market_board'     => 'MARKET_BOARD_REGULER',
+                            'investor_type'    => 'INVESTOR_TYPE_ALL',
+                        ]);
+                }
+            });
+            foreach ($batch as $k => $v) {
+                $sbResponses[$k] = $v;
+            }
+            usleep(250000);
+        }
+
+        $firstKey = $cleanTickers[0] ?? null;
+        if ($firstKey && isset($sbResponses[$firstKey]) && $sbResponses[$firstKey] instanceof \Illuminate\Http\Client\Response) {
+            if (in_array($sbResponses[$firstKey]->status(), [401, 403])) {
+                return ['error' => 'TOKEN_EXPIRED'];
+            }
+        }
+
+        $candidates = [];
+
+        foreach ($cleanTickers as $sym) {
+            $resp = $sbResponses[$sym] ?? null;
+            if (!($resp instanceof \Illuminate\Http\Client\Response) || !$resp->successful()) {
+                continue;
+            }
+
+            $data        = $resp->json('data');
+            $brokersBuy  = $data['broker_summary']['brokers_buy'] ?? [];
+            $brokersSell = $data['broker_summary']['brokers_sell'] ?? [];
+            $totalValue  = (float) ($data['bandar_detector']['value'] ?? $data['bandar_detector']['total_value'] ?? 0);
+
+            if ($totalValue <= 0) {
+                continue;
+            }
+
+            $retailNet = 0.0;
+
+            foreach ($brokersBuy as $b) {
+                if (in_array($b['netbs_broker_code'] ?? '', $retailBrokers)) {
+                    $retailNet += abs((float) ($b['bval'] ?? 0));
+                }
+            }
+
+            foreach ($brokersSell as $s) {
+                if (in_array($s['netbs_broker_code'] ?? '', $retailBrokers)) {
+                    $retailNet -= abs((float) ($s['sval'] ?? 0));
+                }
+            }
+
+            if ($retailNet < 0) {
+                $nrd0Pct = (abs($retailNet) / $totalValue) * 100;
+                $candidates[$sym] = round($nrd0Pct, 1);
+            }
+        }
+
+        if (empty($candidates)) {
+            return [];
+        }
+
+        arsort($candidates);
+        $topCandidates = array_slice($candidates, 0, $limit, true);
+
+        $yfResponses = Http::pool(function (\Illuminate\Http\Client\Pool $pool) use ($topCandidates) {
+            foreach (array_keys($topCandidates) as $sym) {
+                $pool->as($sym)
+                    ->withOptions(['force_ip_resolve' => 'v4'])
+                    ->withHeaders(['User-Agent' => 'Mozilla/5.0'])
+                    ->timeout(8)
+                    ->get("https://query1.finance.yahoo.com/v8/finance/chart/{$sym}.JK", [
+                        'interval' => '1d',
+                        'range'    => '2d',
+                    ]);
+            }
+        });
+
+        $results = [];
+        foreach ($topCandidates as $sym => $nrd0) {
+            $close = 0;
+            $chg   = 0.0;
+
+            $yfResp = $yfResponses[$sym] ?? null;
+            if ($yfResp instanceof \Illuminate\Http\Client\Response && $yfResp->successful()) {
+                $meta      = $yfResp->json('chart.result.0.meta');
+                $close     = (float) ($meta['regularMarketPrice'] ?? 0);
+                $prevClose = (float) ($meta['chartPreviousClose'] ?? $meta['previousClose'] ?? 0);
+
+                if ($close > 0 && $prevClose > 0) {
+                    $chg = (($close - $prevClose) / $prevClose) * 100;
+                }
+            }
+
+            $results[] = [
+                'symbol' => $sym,
+                'nrd0'   => $nrd0,
+                'close'  => $close,
+                'chg'    => round($chg, 1),
+            ];
+        }
+
+        return $results;
+    }
+
+    public function getStockBrokerSummary(string $rawSymbol): ?array
+    {
+        $sym = str_replace('.JK', '', strtoupper(trim($rawSymbol)));
+        if ($sym === '') {
+            return null;
+        }
+
+        $token = $this->getStockbitToken();
+        if (empty($token)) {
+            return null;
+        }
+
+        return Cache::remember("sb_broker_flow_{$sym}", 180, function () use ($sym, $token) {
+            $retailBrokers = ['YP', 'XC', 'XL', 'PD', 'KK', 'NI', 'SQ', 'CC', 'GR', 'EP', 'DR', 'LG'];
+
+            for ($i = 0; $i <= 3; $i++) {
+                $candidate = now('Asia/Jakarta')->subDays($i);
+                if ($candidate->isWeekend()) {
+                    continue;
+                }
+                $dStr = $candidate->format('Y-m-d');
+
+                try {
+                    $resp = Http::withToken($token)
+                        ->withOptions(['force_ip_resolve' => 'v4'])
+                        ->withHeaders([
+                            'Origin'     => 'https://stockbit.com',
+                            'Referer'    => 'https://stockbit.com/',
+                            'User-Agent' => 'Mozilla/5.0',
+                        ])
+                        ->connectTimeout(4)
+                        ->timeout(6)
+                        ->get("https://exodus.stockbit.com/marketdetectors/{$sym}", [
+                            'from'             => $dStr,
+                            'to'               => $dStr,
+                            'transaction_type' => 'TRANSACTION_TYPE_NET',
+                            'market_board'     => 'MARKET_BOARD_REGULER',
+                            'investor_type'    => 'INVESTOR_TYPE_ALL',
+                        ]);
+
+                    if (!$resp->successful()) {
+                        if (in_array($resp->status(), [401, 403])) {
+                            return null;
+                        }
+                        continue;
+                    }
+
+                    $data = $resp->json('data');
+                    $brokersBuy  = $data['broker_summary']['brokers_buy'] ?? [];
+                    $brokersSell = $data['broker_summary']['brokers_sell'] ?? [];
+                    $totalValue  = (float) ($data['bandar_detector']['value'] ?? $data['bandar_detector']['total_value'] ?? 0);
+
+                    if ($totalValue <= 0 || (empty($brokersBuy) && empty($brokersSell))) {
+                        continue;
+                    }
+
+                    $retailNet = 0.0;
+                    foreach ($brokersBuy as $b) {
+                        if (in_array($b['netbs_broker_code'] ?? '', $retailBrokers)) {
+                            $retailNet += abs((float) ($b['bval'] ?? 0));
+                        }
+                    }
+                    foreach ($brokersSell as $s) {
+                        if (in_array($s['netbs_broker_code'] ?? '', $retailBrokers)) {
+                            $retailNet -= abs((float) ($s['sval'] ?? 0));
+                        }
+                    }
+
+                    $topBuyers = array_values(array_filter(array_map(
+                        fn($b) => $b['netbs_broker_code'] ?? '',
+                        array_slice($brokersBuy, 0, 5)
+                    )));
+                    $topSellers = array_values(array_filter(array_map(
+                        fn($s) => $s['netbs_broker_code'] ?? '',
+                        array_slice($brokersSell, 0, 5)
+                    )));
+
+                    $retailPct = round((abs($retailNet) / $totalValue) * 100, 1);
+                    $absVal = abs($retailNet);
+                    if ($absVal >= 1_000_000_000) {
+                        $valFmt = 'Rp ' . number_format($absVal / 1_000_000_000, 1, ',', '.') . ' M';
+                    } elseif ($absVal >= 1_000_000) {
+                        $valFmt = 'Rp ' . number_format($absVal / 1_000_000, 0, ',', '.') . ' Jt';
+                    } else {
+                        $valFmt = 'Rp ' . number_format($absVal, 0, ',', '.');
+                    }
+
+                    $accDistRaw = (string) ($data['bandar_detector']['broker_accdist'] ?? 'Netral');
+                    $accDist = trim(str_replace(['_', 'AccDist'], [' ', ''], $accDistRaw)) ?: 'Netral';
+
+                    return [
+                        'date_label'  => $candidate->format('d M'),
+                        'accdist'     => $accDist,
+                        'retail_side' => $retailNet < 0 ? 'Net Sell' : ($retailNet > 0 ? 'Net Buy' : 'Netral'),
+                        'retail_pct'  => $retailPct,
+                        'retail_val'  => $valFmt,
+                        'is_retail_selling' => $retailNet < 0,
+                        'top_buyers'  => $topBuyers,
+                        'top_sellers' => $topSellers,
+                    ];
+                } catch (\Throwable $e) {
+                    continue;
+                }
+            }
+
+            return null;
+        });
+    }
+
 }

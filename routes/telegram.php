@@ -9,7 +9,90 @@ use App\Services\StockAnalysisService;
 use App\Services\StockScreenerService;
 use App\Models\Watchlist;
 
-$sendAnalysisChart = function (Nutgram $bot, string $ticker, StockAnalysisService $service, float $maxRisk = 1000000, string $timeframe = '1D') {
+$formatBrokerFlowBlock = function (string $cleanSym): string {
+    try {
+        $flow = app(StockScreenerService::class)->getStockBrokerSummary($cleanSym);
+        if (!$flow) {
+            return '';
+        }
+        $sideIcon = $flow['is_retail_selling'] ? '🟢' : '🔴';
+        $buyers = !empty($flow['top_buyers']) ? implode(', ', $flow['top_buyers']) : '-';
+        $sellers = !empty($flow['top_sellers']) ? implode(', ', $flow['top_sellers']) : '-';
+
+        return "\n\n🏦 <b>Broker Flow ({$flow['date_label']}):</b>\n"
+             . "• Status: <b>{$flow['accdist']}</b> | {$sideIcon} Ritel {$flow['retail_side']} <b>{$flow['retail_pct']}%</b> ({$flow['retail_val']})\n"
+             . "• Top Buy: <b>{$buyers}</b> | Top Sell: <b>{$sellers}</b>";
+    } catch (\Throwable $e) {
+        return '';
+    }
+};
+
+$buildConfluenceStrategy = function (
+    string $trend,
+    ?float $rsiVal,
+    float $volRatio,
+    float $r1,
+    float $s1,
+    float $sl,
+    string $ma20Text,
+    int $dec,
+    ?array $flow
+): string {
+    $r1Fmt = number_format($r1, $dec);
+    $s1Fmt = number_format($s1, $dec);
+    $slFmt = number_format($sl, $dec);
+
+    $isUptrend   = str_contains($trend, 'Uptrend');
+    $isDowntrend = str_contains($trend, 'Downtrend');
+
+    if ($flow) {
+        $buyers  = !empty($flow['top_buyers']) ? implode(', ', array_slice($flow['top_buyers'], 0, 5)) : 'institusi';
+        $sellers = !empty($flow['top_sellers']) ? implode(', ', array_slice($flow['top_sellers'], 0, 5)) : 'institusi';
+        $isDist  = stripos($flow['accdist'], 'Dist') !== false || !$flow['is_retail_selling'];
+        $isAcc   = stripos($flow['accdist'], 'Acc') !== false && $flow['is_retail_selling'];
+        $volNote = $volRatio < 0.8 ? " &amp; vol sepi ({$volRatio}x)" : "";
+
+        $supportZone = ($ma20Text !== '-' && $ma20Text !== $s1Fmt) ? "S1 ({$s1Fmt}) / MA20 ({$ma20Text})" : "S1 ({$s1Fmt})";
+
+        if (!$isDowntrend && $isDist && $flow['retail_pct'] >= 15) {
+            $posNote = $isUptrend ? "harga bertahan dalam tren naik" : "harga konsolidasi";
+            return "⚠️ <b>Divergence:</b> {$posNote}, namun flow kurang sehat karena ritel net buy ({$flow['retail_pct']}%) sementara <b>{$sellers}</b> distribusi{$volNote}. Titik pantau: koreksi di <b>{$supportZone}</b> atau tunggu breakout R1 (<b>{$r1Fmt}</b>) bervolume.";
+        }
+
+        if (!$isDowntrend && $isAcc) {
+            if ($rsiVal !== null && $rsiVal >= 72) {
+                return "🔥 <b>Strong Confluence:</b> Akumulasi (<b>{$buyers}</b>) saat ritel net sell ({$flow['retail_pct']}%), namun RSI jenuh beli. Titik pantau: tunggu pullback sehat di <b>{$supportZone}</b>.";
+            }
+            return "✅ <b>Bullish Confluence:</b> Teknikal positif didukung akumulasi (<b>{$buyers}</b>) saat ritel net sell ({$flow['retail_pct']}%). Titik pantau: buy on weakness di <b>{$supportZone}</b>, target R1 (<b>{$r1Fmt}</b>).";
+        }
+
+        if ($isDowntrend && $isAcc) {
+            return "👀 <b>Early Accumulation:</b> Tren masih turun, namun mulai terlihat penyerapan (<b>{$buyers}</b>) di tengah jualan ritel ({$flow['retail_pct']}%). Titik pantau: uji bertahan di <b>S1 ({$s1Fmt})</b> &amp; reclaim MA20 (<b>{$ma20Text}</b>), SL {$slFmt}.";
+        }
+
+        if ($isDowntrend && $isDist) {
+            return "🚨 <b>Hindari tangkap pisau jatuh:</b> Tren bearish disertai distribusi (<b>{$sellers}</b>) sementara ritel masih menampung. Titik pantau: wait &amp; see hingga reclaim MA20 (<b>{$ma20Text}</b>).";
+        }
+    }
+
+    $supportZone = ($ma20Text !== '-' && $ma20Text !== $s1Fmt) ? "S1 ({$s1Fmt}) / MA20 ({$ma20Text})" : "S1 ({$s1Fmt})";
+
+    if ($isDowntrend) {
+        return ($rsiVal !== null && $rsiVal <= 30)
+            ? "⚠️ Tren turun kuat namun RSI sudah <b>Oversold</b>. Titik pantau: pantulan di <b>S1 ({$s1Fmt})</b> menuju MA20 (<b>{$ma20Text}</b>), disiplin SL {$slFmt}."
+            : "⚠️ Tren bearish kuat di bawah MA. Titik pantau: wait &amp; see hingga harga mampu reclaim MA20 (<b>{$ma20Text}</b>).";
+    } elseif (str_contains($trend, 'Strong Uptrend')) {
+        return ($rsiVal !== null && $rsiVal >= 72)
+            ? "🔥 Uptrend solid namun RSI jenuh beli. Titik pantau: hindari chasing pucuk, tunggu pullback di <b>{$supportZone}</b>."
+            : "✅ Tren naik sehat terkonfirmasi. Titik pantau: buy on weakness di <b>{$supportZone}</b> dengan target terdekat R1 (<b>{$r1Fmt}</b>).";
+    } elseif (str_contains($trend, 'Pullback in Uptrend')) {
+        return "🟡 Fase koreksi wajar dalam tren naik besar. Titik pantau: pantulan di area <b>{$supportZone}</b> sebagai titik akumulasi.";
+    }
+
+    return "⚖️ Harga bergerak konsolidasi/transisi. Titik pantau: akumulasi dekat <b>{$supportZone}</b> atau tunggu breakout R1 (<b>{$r1Fmt}</b>) bervolume.";
+};
+
+$sendAnalysisChart = function (Nutgram $bot, string $ticker, StockAnalysisService $service, float $maxRisk = 1000000, string $timeframe = '1D') use ($formatBrokerFlowBlock, $buildConfluenceStrategy) {
     $ticker = strtoupper(htmlspecialchars(trim($ticker)));
     $bot->sendMessage("⏳ Sedang menganalisa <b>{$ticker}</b>...", parse_mode: ParseMode::HTML);
 
@@ -81,25 +164,34 @@ $sendAnalysisChart = function (Nutgram $bot, string $ticker, StockAnalysisServic
         }
 
         if ($rrRatio > 0 && $rrRatio < 1.0) {
-            $insight .= "
-⚠️ <b>R:R kurang ideal (1 : {$rrRatio})</b> — harga sudah cukup dekat dengan R1 dibanding jarak SL; tunggu koreksi ke area support agar rasio untung/rugi lebih sehat.";
+            $insight .= "\n⚠️ <b>R:R kurang ideal (1:{$rrRatio})</b> — tunggu koreksi dekat support agar rasio TP/SL lebih sehat.";
         }
 
         $cleanSym = str_replace('.JK', '', $data['symbol']);
-        $caption = "📊 <b>ANALISIS SAHAM: {$cleanSym} [{$tf}]</b>\n" .
+        $brokerFlow = null;
+        try {
+            $brokerFlow = app(StockScreenerService::class)->getStockBrokerSummary($cleanSym);
+        } catch (\Throwable $e) {
+            $brokerFlow = null;
+        }
+        $insight = $buildConfluenceStrategy($trend, $rsiVal, $volRatio, $r1, $s1, $sl, $ma20Text, $dec, $brokerFlow);
+        if ($rrRatio > 0 && $rrRatio < 1.0) {
+            $insight .= "\n⚠️ <b>R:R kurang ideal (1:{$rrRatio})</b> — tunggu koreksi dekat support agar rasio TP/SL lebih sehat.";
+        }
+        $caption = "📊 <b>ANALISIS: {$cleanSym} [{$tf}]</b>\n" .
                    "━━━━━━━━━━━━━━━━━━━━\n" .
                    "💰 <b>Harga:</b> Rp " . number_format($price, $dec) . " (<b>{$sign}{$data['change_pct']}%</b>)\n" .
                    "📈 <b>Tren:</b> {$trend}\n\n" .
-                   "🧭 <b>Indikator &amp; Momentum:</b>\n" .
+                   "🧭 <b>Indikator:</b>\n" .
                    "• MA20: <b>{$ma20Text}</b> | MA50: <b>{$ma50Text}</b> | MA200: <b>{$ma200Text}</b>\n" .
-                   "• RSI (14): <b>{$rsiLabel}</b>\n" .
-                   "• Volume: <b>{$volRatio}x</b> rata-rata ({$volState})\n\n" .
-                   "🎯 <b>Area Kunci &amp; Trading Plan:</b>\n" .
-                   "• Resistance: R1 <b>" . number_format($r1, $dec) . "</b> (+{$r1Pct}%) | R2 <b>" . number_format($r2, $dec) . "</b>\n" .
-                   "• Support: S1 <b>" . number_format($s1, $dec) . "</b> ({$s1Pct}%) | S2 <b>" . number_format($s2, $dec) . "</b>\n" .
-                   "• Plan: TP <b>" . number_format($r1, $dec) . "</b> | SL <b>" . number_format($sl, $dec) . "</b> ({$slPct}%) | R:R <b>1 : {$rrRatio}</b>\n" .
-                   "• Money Mgmt: Maks. <b>{$recLot} Lot</b> (±Rp {$allocRp})\n\n" .
-                   "💡 <b>Catatan Strategi:</b>\n{$insight}";
+                   "• RSI(14): <b>{$rsiLabel}</b> | Vol: <b>{$volRatio}x</b> ({$volState})\n\n" .
+                   "🎯 <b>Area &amp; Trading Plan:</b>\n" .
+                   "• Res: R1 <b>" . number_format($r1, $dec) . "</b> (+{$r1Pct}%) | R2 <b>" . number_format($r2, $dec) . "</b>\n" .
+                   "• Sup: S1 <b>" . number_format($s1, $dec) . "</b> ({$s1Pct}%) | S2 <b>" . number_format($s2, $dec) . "</b>\n" .
+                   "• Plan: TP <b>" . number_format($r1, $dec) . "</b> | SL <b>" . number_format($sl, $dec) . "</b> ({$slPct}%) | R:R <b>1:{$rrRatio}</b>\n" .
+                   "• Lot: Maks. <b>{$recLot} Lot</b> (±Rp {$allocRp})" .
+                   $formatBrokerFlowBlock($cleanSym) . "\n\n" .
+                   "💡 <b>Strategi:</b>\n{$insight}";
 
         $riskInt = (int) round($maxRisk);
         $tfKeyboard = InlineKeyboardMarkup::make()
@@ -144,6 +236,15 @@ $buildTickerKeyboard = function (array $stocks): InlineKeyboardMarkup {
     return $keyboard;
 };
 
+// Simpan chat_id pengguna secara otomatis untuk laporan terjadwal
+$bot->middleware(function (Nutgram $bot, $next) {
+    $cid = $bot->chatId();
+    if ($cid) {
+        \Illuminate\Support\Facades\Cache::forever('telegram_owner_chat_id', (string) $cid);
+    }
+    $next($bot);
+});
+
 $bot->onCommand('start', function (Nutgram $bot) {
     $msg = "Halo! Saya <b>Easy Cuan</b>, bot analisis teknikal & fundamental saham BEI.\n\n"
         . "<b>📊 Teknikal & Trading Plan:</b>\n"
@@ -156,7 +257,8 @@ $bot->onCommand('start', function (Nutgram $bot) {
         . "💰 <code>/dividen 10</code> — Khusus Dividen &gt;= 10%\n"
         . "🔥 <code>/volume</code> — Lonjakan Volume &gt;= 1.5x\n"
         . "🏦 <code>/akumulasi</code> — Deteksi Akumulasi (VSA/OBV)\n"
-        . "📡 <code>/radar</code> — Bandar Intraday Sweep &amp; Unusual Volume (15m)\n\n"
+        . "📡 <code>/radar</code> — Bandar Intraday Sweep &amp; Unusual Volume (15m)\n"
+        . "📉 <code>/topritel</code> — Screener Top Retail Jualan (Broker Summary)\n\n"
         . "<b>💎 Valuasi, Komparasi &amp; Audit:</b>\n"
         . "🌅 <code>/brief</code> — Morning Market Brief &amp; IHSG Macro Radar\n"
         . "🧭 <code>/sektor</code> — Radar Rotasi & Momentum 8 Sektor BEI\n"
@@ -470,6 +572,8 @@ $bot->onCommand('setmenu', function (\SergiX44\Nutgram\Nutgram $bot) {
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('dividen', 'Screener saham dividen yield tinggi'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('volume', 'Deteksi lonjakan volume hari ini'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('akumulasi', 'Deteksi saham akumulasi bandar'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('topritel', 'Screener Top Retail Jualan (Broker Summary)'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('settoken', 'Update Bearer Token Stockbit'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('banding', 'Komparasi head-to-head emiten satu sektor'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('valuasi', 'Nilai wajar intrinsik & Margin of Safety'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('audit', 'Audit kualitas laba & Piotroski F-Score'),
@@ -484,7 +588,7 @@ $bot->onCommand('setmenu', function (\SergiX44\Nutgram\Nutgram $bot) {
 });
 
 
-$bot->onCallbackQueryData('tf:{ticker}:{tf}:{risk}', function (Nutgram $bot, string $ticker, string $tf, string $risk) use ($sendAnalysisChart) {
+$bot->onCallbackQueryData('tf:{ticker}:{tf}:{risk}', function (Nutgram $bot, string $ticker, string $tf, string $risk) use ($sendAnalysisChart, $formatBrokerFlowBlock) {
     $service = app(StockAnalysisService::class);
     $tf = strtoupper(trim($tf));
     $cleanSym = strtoupper(trim($ticker));
@@ -516,7 +620,8 @@ $bot->onCallbackQueryData('tf:{ticker}:{tf}:{risk}', function (Nutgram $bot, str
                    "💰 <b>Harga Terakhir:</b> " . number_format($data['price'], str_ends_with($data['symbol'], ".JK") ? 0 : 2) . " ({$sign}{$data['change_pct']}%)\n" .
                    "🔵 <b>MA 50:</b> " . number_format($data['ma50'], str_ends_with($data['symbol'], ".JK") ? 0 : 2) . "\n" .
                    "🔴 <b>MA 200:</b> {$ma200Text}\n" .
-                   "📈 <b>Status Tren:</b> {$trend}\n";
+                   "📈 <b>Status Tren:</b> {$trend}" .
+                   $formatBrokerFlowBlock($cleanSym) . "\n";
 
         $riskInt = (int) round($maxRisk);
         $tfKeyboard = InlineKeyboardMarkup::make()
@@ -1063,4 +1168,205 @@ $bot->onCallbackQueryData('drill:pantau:{ticker}', function (Nutgram $bot, strin
     } catch (\Throwable $e) {
         $bot->answerCallbackQuery(text: "❌ Gagal menambah watchlist: " . $e->getMessage(), show_alert: true);
     }
+});
+
+
+$bot->onCommand('settoken {token}', function (Nutgram $bot, string $token) {
+    $cleanToken = trim(str_replace('Bearer ', '', $token));
+    $expiresAt = now('Asia/Jakarta')->addHours(24);
+
+    // Dekode payload JWT untuk membaca waktu kedaluwarsa (exp) asli dari Stockbit
+    $parts = explode('.', $cleanToken);
+    if (count($parts) === 3) {
+        $payloadJson = base64_decode(strtr($parts[1], '-_', '+/'));
+        $payload = json_decode($payloadJson ?: '', true);
+        if (is_array($payload) && !empty($payload['exp'])) {
+            $expiresAt = \Carbon\Carbon::createFromTimestamp((int) $payload['exp'], 'Asia/Jakarta');
+        }
+    }
+
+    $ttl = $expiresAt->isFuture() ? $expiresAt : now('Asia/Jakarta')->addHours(30);
+    \Illuminate\Support\Facades\Cache::put('stockbit_bearer_token', $cleanToken, $ttl);
+    \Illuminate\Support\Facades\Cache::forever('stockbit_token_expires_at', $expiresAt->timestamp);
+    \Illuminate\Support\Facades\Cache::forget('stockbit_token_warned');
+
+    $expFmt = $expiresAt->format('d M Y H:i') . ' WIB';
+    $bot->sendMessage(
+        "✅ <b>Token Stockbit berhasil disimpan!</b>\n" .
+        "⏳ Berlaku hingga: <b>{$expFmt}</b>\n" .
+        "🔔 Bot akan otomatis mengingatkan 2 jam sebelum token kedaluwarsa.",
+        parse_mode: ParseMode::HTML
+    );
+});
+
+// Helper render hasil Top Retail Jualan + Inline Keyboard Kalender
+$renderTopRetail = function (Nutgram $bot, ?string $fromDate = null, ?string $toDate = null, bool $editMessage = false) {
+    $tz = 'Asia/Jakarta';
+    $today = now()->timezone($tz)->format('Y-m-d');
+    $from = $fromDate ?: $today;
+    $to   = $toDate ?: $from;
+
+    if ($from > $to) {
+        [$from, $to] = [$to, $from];
+    }
+
+    $screener = app(\App\Services\StockScreenerService::class);
+
+    $universe = [
+        'BBCA', 'BBRI', 'BMRI', 'BBNI', 'BRIS', 'BNGA', 'NISP', 'BDMN', 'BTPS',
+        'TLKM', 'EXCL', 'ISAT', 'TOWR', 'MTEL',
+        'ASII', 'AUTO', 'UNTR', 'ADRO', 'AADI', 'PTBA', 'ITMG', 'ABMM', 'BUMI', 'HRUM', 'INDY',
+        'AMMN', 'ANTM', 'INCO', 'MDKA', 'MBMA', 'TINS', 'NICL', 'NCKL',
+        'ICBP', 'INDF', 'MYOR', 'KLBF', 'MIKA', 'HEAL', 'SIDO',
+        'SMGR', 'INTP', 'CTRA', 'PWON', 'BSDE', 'SMRA', 'PANI', 'NRCA',
+        'ACES', 'AMRT', 'MAPI', 'ERAA', 'JPFA', 'CPIN', 'AKRA', 'PGAS', 'BRPT', 'TPIA', 'CUAN', 'PTRO', 'RAJA', 'VKTR', 'ISSP'
+    ];
+
+    $result = $screener->scanTopRetailSell($universe, 18, $from, $to);
+
+    $prevDay = \Carbon\Carbon::parse($from, $tz)->subWeekday()->format('Y-m-d');
+    $nextDay = \Carbon\Carbon::parse($to, $tz)->addWeekday()->format('Y-m-d');
+    $yesterday = now()->timezone($tz)->subWeekday()->format('Y-m-d');
+    $d3From = now()->timezone($tz)->subWeekdays(2)->format('Y-m-d');
+    $w1From = now()->timezone($tz)->subWeekdays(4)->format('Y-m-d');
+
+    $keyboard = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup::make()
+        ->addRow(
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('Hari Ini', callback_data: "ritel:range:{$today}:{$today}"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('Kemarin', callback_data: "ritel:range:{$yesterday}:{$yesterday}"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('3 Hari', callback_data: "ritel:range:{$d3From}:{$today}"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('1 Minggu', callback_data: "ritel:range:{$w1From}:{$today}")
+        )
+        ->addRow(
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make("⬅️ {$prevDay}", callback_data: "ritel:range:{$prevDay}:{$prevDay}"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make("📅 Kalender", callback_data: "ritel:cal"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make("{$nextDay} ➡️", callback_data: "ritel:range:{$nextDay}:{$nextDay}")
+        );
+
+    $periodLabel = ($from === $to)
+        ? \Carbon\Carbon::parse($from, $tz)->format('d M Y')
+        : \Carbon\Carbon::parse($from, $tz)->format('d M') . ' - ' . \Carbon\Carbon::parse($to, $tz)->format('d M Y');
+
+    if (isset($result['error'])) {
+        $errMsg = $result['error'] === 'NO_TOKEN'
+            ? "⚠️ <b>Token Stockbit belum diatur.</b>\nKirim perintah:\n<code>/settoken PASTE_BEARER_TOKEN</code>"
+            : "⚠️ <b>Token Stockbit sudah expired (401/403).</b>\nAmbil Bearer Token baru lalu kirim ulang lewat:\n<code>/settoken PASTE_BEARER_TOKEN</code>";
+
+        if ($editMessage) {
+            $bot->editMessageText($errMsg, parse_mode: ParseMode::HTML, reply_markup: $keyboard);
+        } else {
+            $bot->sendMessage($errMsg, parse_mode: ParseMode::HTML, reply_markup: $keyboard);
+        }
+        return;
+    }
+
+    if (empty($result)) {
+        $emptyMsg = "ℹ️ <b>Belum ada data distribusi ritel</b> untuk periode <b>{$periodLabel}</b>.\n<i>(Jika memilih hari ini, data baru tersedia setelah pukul 16:15 WIB. Silakan pilih Kemarin atau tanggal bursa lainnya di bawah).</i>";
+        if ($editMessage) {
+            $bot->editMessageText($emptyMsg, parse_mode: ParseMode::HTML, reply_markup: $keyboard);
+        } else {
+            $bot->sendMessage($emptyMsg, parse_mode: ParseMode::HTML, reply_markup: $keyboard);
+        }
+        return;
+    }
+
+    $lines = [
+        "📉 <b>TOP RETAIL JUALAN</b>",
+        "Periode: <b>{$periodLabel}</b> • <i>Market Reguler</i>\n",
+        "<pre>Symbol | Sell% |  Close |   Chg1",
+        "-------|-------|--------|-------"
+    ];
+
+    foreach ($result as $row) {
+        $sym   = str_pad($row['symbol'], 6);
+        $nrd   = str_pad(number_format($row['nrd0'], 1) . '%', 5, ' ', STR_PAD_LEFT);
+        $close = str_pad(number_format($row['close'], 0, ',', '.'), 6, ' ', STR_PAD_LEFT);
+        $sign  = $row['chg'] > 0 ? '+' : '';
+        $chg   = str_pad($sign . number_format($row['chg'], 1) . '%', 6, ' ', STR_PAD_LEFT);
+
+        $lines[] = "{$sym} | {$nrd} | {$close} | {$chg}";
+    }
+
+    $lines[] = "</pre>";
+    $lines[] = "💡 <i>Ketik /topritel YYYY-MM-DD atau /topritel YYYY-MM-DD YYYY-MM-DD untuk periode kustom.</i>";
+
+    $text = implode("\n", $lines);
+
+    if ($editMessage) {
+        $bot->editMessageText($text, parse_mode: ParseMode::HTML, reply_markup: $keyboard);
+    } else {
+        $bot->sendMessage($text, parse_mode: ParseMode::HTML, reply_markup: $keyboard);
+    }
+};
+
+$handleTopRetailCmd = function (Nutgram $bot, ?string $args = null) use ($renderTopRetail) {
+    try {
+        $rawArgs = trim($args ?? '');
+        $parts = $rawArgs !== '' ? preg_split('/\s+/', $rawArgs) : [];
+
+        $normalizeDate = function (?string $raw): ?string {
+            if (empty($raw)) return null;
+            $raw = str_replace('/', '-', trim($raw));
+            if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $raw)) {
+                return $raw;
+            }
+            if (preg_match('/^(\d{2})-(\d{2})-(\d{2})$/', $raw, $m)) {
+                return "20{$m[1]}-{$m[2]}-{$m[3]}";
+            }
+            if (preg_match('/^(\d{2})-(\d{2})-(\d{4})$/', $raw, $m)) {
+                return "{$m[3]}-{$m[2]}-{$m[1]}";
+            }
+            return null;
+        };
+
+        $from = $normalizeDate($parts[0] ?? null);
+        $to   = $normalizeDate($parts[1] ?? null) ?? $from;
+
+        $bot->sendMessage('⏳ Memindai broker summary...');
+        $renderTopRetail($bot, $from, $to, false);
+    } catch (\Throwable $e) {
+        $bot->sendMessage("❌ <b>Error /topritel:</b> " . htmlspecialchars($e->getMessage()), parse_mode: ParseMode::HTML);
+    }
+};
+
+$bot->onText('^/[Tt]opritel(?:@[a-zA-Z0-9_]+)?(?:\s+(.+))?$', function (Nutgram $bot, ?string $args = null) use ($handleTopRetailCmd) {
+    $handleTopRetailCmd($bot, $args);
+});
+
+
+$bot->onCallbackQueryData('ritel:range:{from}:{to}', function (Nutgram $bot, string $from, string $to) use ($renderTopRetail) {
+    $bot->answerCallbackQuery(text: "⏳ Memuat data {$from}...");
+    $bot->sendMessage("⏳ Memindai broker summary periode <b>{$from}</b>...", parse_mode: ParseMode::HTML);
+    $renderTopRetail($bot, $from, $to, false);
+});
+
+$bot->onCallbackQueryData('ritel:cal', function (Nutgram $bot) {
+    $bot->answerCallbackQuery();
+    $tz = 'Asia/Jakarta';
+    $cursor = now()->timezone($tz);
+
+    $calKeyboard = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup::make();
+    $rowButtons = [];
+
+    for ($i = 0; $i < 12; $i++) {
+        $dStr = $cursor->format('Y-m-d');
+        $lbl  = $cursor->format('d M (D)');
+        $rowButtons[] = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make($lbl, callback_data: "ritel:range:{$dStr}:{$dStr}");
+
+        if (count($rowButtons) === 3) {
+            $calKeyboard->addRow(...$rowButtons);
+            $rowButtons = [];
+        }
+        $cursor = $cursor->subWeekday();
+    }
+
+    if (!empty($rowButtons)) {
+        $calKeyboard->addRow(...$rowButtons);
+    }
+
+    $bot->editMessageText(
+        "📅 <b>Pilih Tanggal Bursa (12 Hari Kerja Terakhir):</b>\n<i>Atau ketik manual:</i> <code>/topritel 2026-11-10 2026-11-18</code>",
+        parse_mode: ParseMode::HTML,
+        reply_markup: $calKeyboard
+    );
 });
