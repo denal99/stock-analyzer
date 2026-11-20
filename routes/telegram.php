@@ -184,6 +184,24 @@ $sendAnalysisChart = function (Nutgram $bot, string $ticker, StockAnalysisServic
         if ($rrRatio > 0 && $rrRatio < 1.0) {
             $insight .= "\n⚠️ <b>R:R kurang ideal (1:{$rrRatio})</b> — tunggu koreksi dekat support agar rasio TP/SL lebih sehat.";
         }
+        // Kalkulasi Area Buy Dinamis (BoW / BoB)
+        $ma20Val = isset($data['ma20']) && is_numeric($data['ma20']) ? (float) $data['ma20'] : null;
+        if (str_contains($trend, 'Strong Downtrend')) {
+            $buyAreaText = "Wait &amp; See (BoB &gt; <b>" . number_format($r1, $dec) . "</b>)";
+        } elseif ($ma20Val !== null && $ma20Val < $price && $ma20Val > ($sl * 1.005)) {
+            $lowBuy  = min($ma20Val, (float) $s1);
+            $highBuy = max($ma20Val, (float) $s1);
+            if ($highBuy >= $price) {
+                $highBuy = (float) $s1;
+            }
+            $rangeStr = (abs($highBuy - $lowBuy) > 0)
+                ? "<b>" . number_format($lowBuy, $dec) . " - " . number_format($highBuy, $dec) . "</b>"
+                : "<b>" . number_format($s1, $dec) . "</b>";
+            $buyAreaText = "{$rangeStr} (BoW) / &gt; <b>" . number_format($r1, $dec) . "</b> (BoB)";
+        } else {
+            $buyAreaText = "<b>" . number_format($s1, $dec) . "</b> (BoW) / &gt; <b>" . number_format($r1, $dec) . "</b> (BoB)";
+        }
+
         $caption = "📊 <b>ANALISIS: {$cleanSym} [{$tf}]</b>\n" .
                    "━━━━━━━━━━━━━━━━━━━━\n" .
                    "💰 <b>Harga:</b> Rp " . number_format($price, $dec) . " (<b>{$sign}{$data['change_pct']}%</b>)\n" .
@@ -194,6 +212,7 @@ $sendAnalysisChart = function (Nutgram $bot, string $ticker, StockAnalysisServic
                    "🎯 <b>Area &amp; Trading Plan:</b>\n" .
                    "• Res: R1 <b>" . number_format($r1, $dec) . "</b> (+{$r1Pct}%) | R2 <b>" . number_format($r2, $dec) . "</b>\n" .
                    "• Sup: S1 <b>" . number_format($s1, $dec) . "</b> ({$s1Pct}%) | S2 <b>" . number_format($s2, $dec) . "</b>\n" .
+                   "• Buy: {$buyAreaText}\n" .
                    "• Plan: TP <b>" . number_format($r1, $dec) . "</b> | SL <b>" . number_format($sl, $dec) . "</b> ({$slPct}%) | R:R <b>1:{$rrRatio}</b>\n" .
                    "• Lot: Maks. <b>{$recLot} Lot</b> (±Rp {$allocRp})" .
                    $formatBrokerFlowBlock($cleanSym) . "\n\n" .
