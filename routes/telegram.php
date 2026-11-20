@@ -351,11 +351,23 @@ $sendKronosForecast = function (Nutgram $bot, string $ticker, StockAnalysisServi
         }
     } catch (\Throwable $e) {}
 
+    $probLines = "";
+    if (isset($forecast['upside_probability'])) {
+        $upProb = number_format((float) $forecast['upside_probability'], 1);
+        $probIcon = $forecast['upside_probability'] >= 60 ? '🟢' : ($forecast['upside_probability'] <= 40 ? '🔴' : '🟡');
+        $probLines .= "🎲 Upside Probability (5D): {$probIcon} <b>{$upProb}%</b>\n";
+    }
+    if (isset($forecast['volatility_amplification'])) {
+        $volProb = number_format((float) $forecast['volatility_amplification'], 1);
+        $probLines .= "⚡ Volatility Amplification: <b>{$volProb}%</b>\n";
+    }
+
     $msg = "🤖 <b>KRONOS AI FORECAST: {$cleanSym} (5D)</b>\n"
          . "━━━━━━━━━━━━━━━━━━━━\n"
          . "💰 Harga Terakhir: <b>Rp {$lastFmt}</b>\n"
          . "🎯 Proyeksi H+5: <b>Rp {$targetFmt} ({$chgSign}{$chg}%)</b>\n"
          . "🧭 Arah Bias AI: <b>{$biasIcon}</b>\n"
+         . $probLines
          . "📊 Rentang 5 Hari: <b>Rp {$lowFmt} – Rp {$highFmt}</b>\n\n"
          . "📅 <b>Estimasi Lintasan Harian:</b>\n"
          . $stepsText
