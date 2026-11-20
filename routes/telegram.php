@@ -1627,6 +1627,96 @@ $bot->onCallbackQueryData('quick:brief', function (\SergiX44\Nutgram\Nutgram $bo
     }
 });
 
+// KRONOS AI UPSIDE SCREENER (>80% Upside Probability 5D)
+$runKronosScan = function (\SergiX44\Nutgram\Nutgram $bot) {
+    $waitMsg = $bot->sendMessage(
+        "🤖 <b>Memindai Screener Kronos AI (Upside Probability &gt; 80%)...</b>\n<i>Menganalisa simulasi Monte Carlo 5D pada emiten likuid BEI (±30–45 detik)...</i>",
+        parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML
+    );
+
+    try {
+        $scan = app(\App\Services\StockScreenerService::class)->screenKronosUpside(80.0, 28);
+        $results = $scan['results'] ?? [];
+        $scanned = $scan['scanned_count'] ?? 0;
+
+        if (empty($results)) {
+            $reply = "🤖 <b>KRONOS AI SCREENER (Upside Prob &gt; 80%)</b>\n"
+                   . "━━━━━━━━━━━━━━━━━━━━\n"
+                   . "Tidak ditemukan emiten dengan <b>Upside Probability (5D) &gt; 80%</b> dari {$scanned} emiten likuid BEI yang dipindai saat ini.\n\n"
+                   . "<i>Gunakan <code>/forecast KODE</code> untuk mengecek probabilitas emiten spesifik.</i>";
+        } else {
+            $lines = "";
+            foreach ($results as $idx => $item) {
+                $no     = $idx + 1;
+                $sym    = $item['symbol'];
+                $last   = number_format((float) $item['last_close'], 0);
+                $target = number_format((float) $item['target_close'], 0);
+                $chg    = $item['change_pct'];
+                $sign   = $chg >= 0 ? '+' : '';
+                $prob   = number_format((float) $item['upside_probability'], 1);
+                $volAmp = isset($item['volatility_amplification']) ? number_format((float) $item['volatility_amplification'], 1) . '%' : '-';
+
+                $flowBadge = '';
+                if (!empty($item['accdist']) && $item['accdist'] !== '-') {
+                    $rIcon = ($item['is_retail_selling'] ?? false) ? '🟢' : '🔴';
+                    $flowBadge = " | Bandarmologi: <b>{$item['accdist']}</b> ({$rIcon} Ritel {$item['retail_side']} {$item['retail_pct']}%)";
+                }
+
+                $lines .= "{$no}. <b>{$sym}</b> — Prob Naik: 🟢 <b>{$prob}%</b>\n"
+                        . "   • Rp {$last} ➔ H+5: <b>Rp {$target} ({$sign}{$chg}%)</b> | VolAmp: {$volAmp}{$flowBadge}\n";
+            }
+
+            $reply = "🤖 <b>KRONOS AI SCREENER (Upside Prob &gt; 80%)</b>\n"
+                   . "━━━━━━━━━━━━━━━━━━━━\n"
+                   . "Ditemukan <b>" . count($results) . " emiten</b> (dari {$scanned} emiten likuid BEI) dengan probabilitas kenaikan 5 hari &gt; 80%:\n\n"
+                   . $lines
+                   . "\n<i>💡 Ketik <code>/forecast KODE</code> untuk melihat chart lintasan harian &amp; konfirmasi R1/S1.</i>";
+        }
+
+        if ($waitMsg) {
+            try {
+                $bot->deleteMessage($waitMsg->chat->id, $waitMsg->message_id);
+            } catch (\Throwable $e) {}
+        }
+
+        $keyboard = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup::make();
+        if (!empty($results)) {
+            $rowCount = 0;
+            $row = [];
+            foreach ($results as $item) {
+                $sym = $item['symbol'];
+                $row[] = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make("📊 {$sym}", callback_data: "analisa:{$sym}");
+                $rowCount++;
+                if ($rowCount % 3 === 0) {
+                    $keyboard->addRow(...$row);
+                    $row = [];
+                }
+            }
+            if (!empty($row)) {
+                $keyboard->addRow(...$row);
+            }
+        }
+        $keyboard->addRow(
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make("🔄 Scan Ulang", callback_data: "quick:kronos_scan")
+        );
+
+        $bot->sendMessage(
+            $reply,
+            parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML,
+            reply_markup: $keyboard
+        );
+    } catch (\Throwable $e) {
+        $bot->sendMessage("❌ Gagal menjalankan Kronos Screener: " . htmlspecialchars($e->getMessage()), parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML);
+    }
+};
+
+$bot->onCommand('kronos_scan', $runKronosScan);
+$bot->onCommand('aiscan', $runKronosScan);
+$bot->onCallbackQueryData('quick:kronos_scan', function (\SergiX44\Nutgram\Nutgram $bot) use ($runKronosScan) {
+    $bot->answerCallbackQuery();
+    $runKronosScan($bot);
+});
+
 // UNKNOWN_COMMAND_FALLBACK: Tangani perintah atau pesan yang tidak dikenali
 $bot->fallback(function (\SergiX44\Nutgram\Nutgram $bot) {
     if ($bot->callbackQuery() !== null) {

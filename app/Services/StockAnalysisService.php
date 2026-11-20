@@ -833,7 +833,7 @@ class StockAnalysisService
                     'symbol'       => $symbol,
                     'candles'      => array_slice($candles, -200),
                     'pred_len'     => $predLen,
-                    'sample_count' => 6,
+                    'sample_count' => 10,
                 ]);
 
                 if (!$aiResp->successful()) {

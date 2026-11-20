@@ -1579,4 +1579,57 @@ class StockScreenerService
         });
     }
 
+
+    public function screenKronosUpside(float $minProb = 80.0, int $maxTickers = 28): array
+    {
+        $analysisSvc = app(StockAnalysisService::class);
+        $tickers = array_slice($this->watchlist, 0, $maxTickers);
+        $matches = [];
+
+        foreach ($tickers as $rawSym) {
+            $cleanSym = strtoupper(str_replace('.JK', '', trim($rawSym)));
+            $forecast = $analysisSvc->forecastWithKronos($cleanSym, 5);
+
+            if (!$forecast || !isset($forecast['upside_probability'])) {
+                continue;
+            }
+
+            $prob = (float) $forecast['upside_probability'];
+            if ($prob > $minProb) {
+                $flow = null;
+                try {
+                    $flow = $this->getStockBrokerSummary($cleanSym);
+                } catch (\Throwable $e) {
+                    $flow = null;
+                }
+
+                $matches[] = [
+                    'symbol'                   => $cleanSym,
+                    'last_close'               => $forecast['last_close'],
+                    'target_close'             => $forecast['target_close'],
+                    'change_pct'               => $forecast['change_pct'],
+                    'upside_probability'       => $prob,
+                    'volatility_amplification' => $forecast['volatility_amplification'] ?? null,
+                    'bias'                     => $forecast['bias'] ?? 'BULLISH',
+                    'accdist'                  => $flow['accdist'] ?? '-',
+                    'is_retail_selling'        => $flow['is_retail_selling'] ?? null,
+                    'retail_side'              => $flow['retail_side'] ?? null,
+                    'retail_pct'               => $flow['retail_pct'] ?? null,
+                ];
+            }
+        }
+
+        usort($matches, function ($a, $b) {
+            if ($b['upside_probability'] !== $a['upside_probability']) {
+                return $b['upside_probability'] <=> $a['upside_probability'];
+            }
+            return $b['change_pct'] <=> $a['change_pct'];
+        });
+
+        return [
+            'scanned_count' => count($tickers),
+            'min_prob'      => $minProb,
+            'results'       => $matches,
+        ];
+    }
 }
