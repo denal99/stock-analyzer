@@ -135,6 +135,7 @@ class MarketSessionReportService
             $topLosers,
             $topForeignBuy,
             $topLocalBuy,
+            $activeTradeDate,
             $foreignFollow,
             $rebound3d,
             $volSpikes,
@@ -489,6 +490,7 @@ class MarketSessionReportService
         array $topLosers,
         array $topForeignBuy,
         array $topLocalBuy,
+        string $flowDate,
         array $foreignFollow,
         array $rebound3d,
         array $volSpikes,
@@ -528,24 +530,26 @@ class MarketSessionReportService
             }
         }
 
+        $flowDateLabel = \Carbon\Carbon::parse($flowDate)->format('d M');
+
         $lines[] = "";
-        $lines[] = "🌍 <b>Top Foreign Buy:</b>";
+        $lines[] = "🌍 <b>Top Foreign Buy ({$flowDateLabel}):</b>";
         if (empty($topForeignBuy)) {
             $lines[] = "• <i>Belum ada net foreign buy signifikan</i>";
         } else {
             foreach ($topForeignBuy as $r) {
-                $sign = $r['change_pct'] >= 0 ? '+' : '';
+                $sign = $r['change_pct'] > 0 ? '+' : '';
                 $lines[] = "• <b>{$r['symbol']}</b>: Net Buy <b>Rp {$r['net_b']} M</b> ({$sign}{$r['change_pct']}%)";
             }
         }
 
         $lines[] = "";
-        $lines[] = "🏠 <b>Top Local Buy:</b>";
+        $lines[] = "🏠 <b>Top Local Buy ({$flowDateLabel}):</b>";
         if (empty($topLocalBuy)) {
             $lines[] = "• <i>Belum ada net local buy signifikan</i>";
         } else {
             foreach ($topLocalBuy as $r) {
-                $sign = $r['change_pct'] >= 0 ? '+' : '';
+                $sign = $r['change_pct'] > 0 ? '+' : '';
                 $lines[] = "• <b>{$r['symbol']}</b>: Net Buy <b>Rp {$r['net_b']} M</b> ({$sign}{$r['change_pct']}%)";
             }
         }
@@ -561,7 +565,7 @@ class MarketSessionReportService
         }
 
         $lines[] = "";
-        $lines[] = "🔄 <b>Naik Setelah Turun 3 Hari:</b>";
+        $lines[] = "🔄 <b>Rebound Setelah Turun ≥3 Hari:</b>";
         if (empty($rebound3d)) {
             $lines[] = "• <i>Belum ada kandidat technical rebound 3D</i>";
         } else {
@@ -576,7 +580,7 @@ class MarketSessionReportService
             $lines[] = "• <i>Belum ada lonjakan volume &gt;= 2x</i>";
         } else {
             foreach ($volSpikes as $r) {
-                $sign = $r['change_pct'] >= 0 ? '+' : '';
+                $sign = $r['change_pct'] > 0 ? '+' : '';
                 $lines[] = "• <b>{$r['symbol']}</b>: <b>{$r['rvol']}x</b> ({$sign}{$r['change_pct']}%)";
             }
         }
