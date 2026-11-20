@@ -380,19 +380,39 @@ class StockScreenerService
                     $m3Price = $this->roundToIdxTick($eps * $fairPe);
                 }
             } else {
-                // Model Non-Bank (Manufaktur, Komoditas, Konsumer, Telko, dll.)
-                // 1. Graham Number = sqrt(22.5 * EPS * BVPS)
-                $m1Label = 'Graham Number';
+                // Deteksi Sektor Siklikal / Komoditas (Batu Bara, Migas, Tambang Logam, Perkebunan)
+                $sectorRaw = strtolower((string) $sector);
+                $industryRaw = strtolower((string) ($summary['assetProfile']['industry'] ?? ''));
+                $cyclicalTickers = [
+                    'ABMM', 'ADRO', 'AADI', 'PTBA', 'ITMG', 'INDY', 'BUMI',
+                    'HRUM', 'BYAN', 'GEMS', 'DOID', 'MBAP', 'TOBA', 'UNTR',
+                    'MEDC', 'ELSA', 'ENRG', 'PGAS', 'AKRA', 'ANTM', 'INCO',
+                    'MDKA', 'MBMA', 'NCKL', 'TINS', 'AMMN', 'BRMS', 'PSAB',
+                    'AALI', 'LSIP', 'TAPG', 'DSNG', 'SSMS'
+                ];
+                $isCyclical = in_array($sym, $cyclicalTickers, true)
+                    || str_contains($sectorRaw, 'energy')
+                    || str_contains($sectorRaw, 'basic materials')
+                    || str_contains($industryRaw, 'coal')
+                    || str_contains($industryRaw, 'mining')
+                    || str_contains($industryRaw, 'oil');
+
+                // Model Non-Bank: Parameter lebih konservatif untuk sektor siklikal
+                $grahamMult = $isCyclical ? 9.0 : 22.5;
+                $epvDiscount = $isCyclical ? 0.15 : 0.10;
+
+                // 1. Graham Number = sqrt(grahamMult * EPS * BVPS)
+                $m1Label = $isCyclical ? 'Graham Number (Siklikal)' : 'Graham Number';
                 $m1Price = null;
                 if ($eps !== null && $eps > 0 && $bvps !== null && $bvps > 0) {
-                    $m1Price = $this->roundToIdxTick(sqrt(22.5 * $eps * $bvps));
+                    $m1Price = $this->roundToIdxTick(sqrt($grahamMult * $eps * $bvps));
                 }
 
-                // 2. Earnings Power Value (EPV) = EPS / Cost of Equity (10%)
-                $m2Label = 'Earnings Power (EPV)';
+                // 2. Earnings Power Value (EPV) = EPS / Cost of Equity
+                $m2Label = $isCyclical ? 'Earnings Power (EPV Siklikal)' : 'Earnings Power (EPV)';
                 $m2Price = null;
                 if ($eps !== null && $eps > 0) {
-                    $m2Price = $this->roundToIdxTick($eps / 0.10);
+                    $m2Price = $this->roundToIdxTick($eps / $epvDiscount);
                 }
 
                 // Fallback Book Value jika EPS negatif sehingga Graham & EPV N/A

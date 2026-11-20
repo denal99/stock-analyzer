@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Storage;
 use Exception;
 
@@ -26,18 +27,34 @@ class StockAnalysisService
             '1H' => ['range' => '3mo', 'interval' => '60m', 'label' => '1H Intraday', 'unit' => 'day', 'date_fmt' => 'd/m/Y H:i'],
             default => ['range' => '2y', 'interval' => '1d', 'label' => 'Daily', 'unit' => 'day', 'date_fmt' => 'd/m/Y'],
         };
-        $url = "https://query1.finance.yahoo.com/v8/finance/chart/{$symbol}?range={$tfConfig['range']}&interval={$tfConfig['interval']}";
-        
-        $response = Http::timeout(20)
-            ->withOptions(['force_ip_resolve' => 'v4'])
-            ->withHeaders(['User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'])
-            ->get($url);
+        $dataSource = 'Yahoo Finance';
+        $result = null;
 
-        if ($response->failed() or empty($response->json('chart.result.0'))) {
-            throw new Exception("Kode saham '{$symbol}' tidak ditemukan atau API sedang gangguan.");
+        // 1. Prioritaskan data Real-Time Stockbit untuk saham BEI (.JK) jika token tersedia
+        if (str_ends_with($symbol, '.JK')) {
+            $sbResult = $this->fetchStockbitChartResult(substr($symbol, 0, -3), $tf);
+            if ($sbResult !== null) {
+                $result = $sbResult;
+                $dataSource = 'Stockbit RT';
+            }
         }
 
-        $result = $response->json('chart.result.0');
+        // 2. Fallback otomatis ke Yahoo Finance jika token kosong / expired / bukan saham IDX
+        if ($result === null) {
+            $url = "https://query1.finance.yahoo.com/v8/finance/chart/{$symbol}?range={$tfConfig['range']}&interval={$tfConfig['interval']}";
+
+            $response = Http::timeout(20)
+                ->withOptions(['force_ip_resolve' => 'v4'])
+                ->withHeaders(['User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'])
+                ->get($url);
+
+            if ($response->failed() or empty($response->json('chart.result.0'))) {
+                throw new Exception("Kode saham '{$symbol}' tidak ditemukan atau API sedang gangguan.");
+            }
+
+            $result = $response->json('chart.result.0');
+        }
+
         $timestamps = $result['timestamp'] ?? [];
         $quotes = $result['indicators']['quote'][0] ?? [];
 
@@ -205,6 +222,7 @@ class StockAnalysisService
             'date' => date($tfConfig['date_fmt'], $lastCandle['ts']),
             'tf_label' => $tfConfig['label'],
             'tf_unit' => $tfConfig['unit'],
+            'data_source' => $dataSource,
             'o' => $lastCandle['o'],
             'h' => $lastCandle['h'],
             'l' => $lastCandle['l'],
@@ -243,6 +261,7 @@ class StockAnalysisService
 
         return [
             'symbol' => $symbol,
+            'data_source' => $dataSource,
             'price' => $lastClose,
             'change_pct' => $changePct,
             'ma20' => $lastMa20,
@@ -259,6 +278,8 @@ class StockAnalysisService
             'alloc_rp' => $metaInfo['alloc_rp'] ?? 0,
             'signal' => $metaInfo['signal'] ?? '',
             'vol_ratio' => $metaInfo['vol_ratio'] ?? 0,
+            'data_source' => $dataSource,
+            'last_date' => $metaInfo['date'] ?? '',
             'chart_path' => $chartPath,
         ];
     }
@@ -673,7 +694,7 @@ class StockAnalysisService
 
         // Watermark Ticker di Tengah Chart
         $this->drawText($canvas, 18, 520, $headerHeight + 25, $gray, $meta['symbol'], true);
-        $this->drawText($canvas, 9, 492, $headerHeight + 52, $gray, "Technical Screener Bot", false);
+        $this->drawText($canvas, 9, 492, $headerHeight + 52, $gray, "Technical Screener Bot | " . ($meta['data_source'] ?? 'Yahoo Finance'), false);
 
         // Baris 1: OHLC & Change
         $chgSign = $meta['chg'] >= 0 ? '+' : '';
@@ -754,4 +775,434 @@ class StockAnalysisService
 
         return Storage::disk('local')->path($fileName);
     }
+
+    public function forecastWithKronos(string $symbol, int $predLen = 5): ?array
+    {
+        $symbol = strtoupper(trim($symbol));
+        if (!str_contains($symbol, '.') && !str_starts_with($symbol, '^') && !str_contains($symbol, '-')) {
+            $symbol .= '.JK';
+        }
+
+        $cacheKey = "kronos_forecast_{$symbol}_{$predLen}_" . now('Asia/Jakarta')->format('Y-m-d-H');
+        return \Illuminate\Support\Facades\Cache::remember($cacheKey, 1800, function () use ($symbol, $predLen) {
+            try {
+                $url = "https://query1.finance.yahoo.com/v8/finance/chart/{$symbol}?range=1y&interval=1d";
+                $response = \Illuminate\Support\Facades\Http::withHeaders([
+                    'User-Agent' => 'Mozilla/5.0'
+                ])->timeout(15)->get($url);
+
+                if (!$response->successful()) {
+                    return null;
+                }
+
+                $result = $response->json()['chart']['result'][0] ?? null;
+                if (!$result || empty($result['timestamp'])) {
+                    return null;
+                }
+
+                $timestamps = $result['timestamp'];
+                $quote = $result['indicators']['quote'][0] ?? [];
+                $candles = [];
+
+                foreach ($timestamps as $i => $ts) {
+                    $o = $quote['open'][$i] ?? null;
+                    $h = $quote['high'][$i] ?? null;
+                    $l = $quote['low'][$i] ?? null;
+                    $c = $quote['close'][$i] ?? null;
+                    $v = $quote['volume'][$i] ?? 0;
+
+                    if ($o === null || $h === null || $l === null || $c === null) {
+                        continue;
+                    }
+
+                    $candles[] = [
+                        'timestamp' => date('Y-m-d', $ts),
+                        'open'      => (float) $o,
+                        'high'      => (float) $h,
+                        'low'       => (float) $l,
+                        'close'     => (float) $c,
+                        'volume'    => (float) $v,
+                    ];
+                }
+
+                if (count($candles) < 35) {
+                    return null;
+                }
+
+                $aiResp = \Illuminate\Support\Facades\Http::timeout(45)->post('http://127.0.0.1:8001/predict', [
+                    'symbol'       => $symbol,
+                    'candles'      => array_slice($candles, -200),
+                    'pred_len'     => $predLen,
+                    'sample_count' => 3,
+                ]);
+
+                if (!$aiResp->successful()) {
+                    return null;
+                }
+
+                $aiData = $aiResp->json();
+                if (!is_array($aiData) || empty($aiData['steps'])) {
+                    return null;
+                }
+
+                $closesAll = array_column($candles, 'close');
+                $totalC = count($candles);
+                $startIdx = max(0, $totalC - 35);
+                $histSeries = [];
+                for ($i = $startIdx; $i < $totalC; $i++) {
+                    $ma20 = null;
+                    if ($i >= 19) {
+                        $slice20 = array_slice($closesAll, $i - 19, 20);
+                        $ma20 = round(array_sum($slice20) / 20, 2);
+                    }
+                    $histSeries[] = [
+                        'date'  => date('d M', strtotime($candles[$i]['timestamp'])),
+                        'close' => (float) $candles[$i]['close'],
+                        'ma20'  => $ma20,
+                    ];
+                }
+                $aiData['history'] = $histSeries;
+
+                return $aiData;
+            } catch (\Throwable $e) {
+                return null;
+            }
+        });
+    }
+
+    public function generateKronosForecastChart(array $forecast): ?string
+    {
+        if (empty($forecast['history']) || empty($forecast['steps'])) {
+            return null;
+        }
+
+        try {
+            $cleanSym = str_replace('.JK', '', $forecast['symbol']);
+            $hist = $forecast['history'];
+            $steps = $forecast['steps'];
+
+            $labels = [];
+            $histCloses = [];
+            $histMa20 = [];
+            $predLine = [];
+            $predHigh = [];
+            $predLow = [];
+
+            foreach ($hist as $h) {
+                $labels[] = $h['date'];
+                $histCloses[] = $h['close'];
+                $histMa20[] = $h['ma20'];
+                $predLine[] = null;
+                $predHigh[] = null;
+                $predLow[] = null;
+            }
+
+            $lastIdx = count($histCloses) - 1;
+            $predLine[$lastIdx] = $histCloses[$lastIdx];
+            $predHigh[$lastIdx] = $histCloses[$lastIdx];
+            $predLow[$lastIdx]  = $histCloses[$lastIdx];
+
+            foreach ($steps as $idx => $st) {
+                $labels[] = '+' . ($idx + 1) . 'D (' . date('d/m', strtotime($st['date'])) . ')';
+                $histCloses[] = null;
+                $histMa20[] = null;
+                $predLine[] = (float) $st['close'];
+                $predHigh[] = (float) $st['high'];
+                $predLow[]  = (float) $st['low'];
+            }
+
+            $bias = $forecast['bias'] ?? 'SIDEWAYS';
+            $biasColor = match ($bias) {
+                'BULLISH' => '#22c55e',
+                'BEARISH' => '#ef4444',
+                default   => '#eab308',
+            };
+            $biasFill = match ($bias) {
+                'BULLISH' => 'rgba(34, 197, 94, 0.18)',
+                'BEARISH' => 'rgba(239, 68, 68, 0.18)',
+                default   => 'rgba(234, 179, 8, 0.18)',
+            };
+
+            $chartConfig = [
+                'type' => 'line',
+                'data' => [
+                    'labels' => $labels,
+                    'datasets' => [
+                        [
+                            'label' => 'Harga Historis',
+                            'data' => $histCloses,
+                            'borderColor' => '#38bdf8',
+                            'borderWidth' => 2.5,
+                            'pointRadius' => 1.5,
+                            'tension' => 0.15,
+                            'fill' => false,
+                        ],
+                        [
+                            'label' => 'MA 20',
+                            'data' => $histMa20,
+                            'borderColor' => '#a855f7',
+                            'borderWidth' => 1.4,
+                            'pointRadius' => 0,
+                            'tension' => 0.15,
+                            'fill' => false,
+                        ],
+                        [
+                            'label' => 'Proyeksi Kronos (5D)',
+                            'data' => $predLine,
+                            'borderColor' => $biasColor,
+                            'backgroundColor' => $biasColor,
+                            'borderWidth' => 2.8,
+                            'borderDash' => [6, 4],
+                            'pointRadius' => 4,
+                            'tension' => 0.15,
+                            'fill' => false,
+                        ],
+                        [
+                            'label' => 'Batas Atas (High)',
+                            'data' => $predHigh,
+                            'borderColor' => 'rgba(148, 163, 184, 0.45)',
+                            'borderWidth' => 1,
+                            'borderDash' => [3, 3],
+                            'pointRadius' => 0,
+                            'fill' => false,
+                        ],
+                        [
+                            'label' => 'Rentang Low-High',
+                            'data' => $predLow,
+                            'borderColor' => 'rgba(148, 163, 184, 0.45)',
+                            'backgroundColor' => $biasFill,
+                            'borderWidth' => 1,
+                            'borderDash' => [3, 3],
+                            'pointRadius' => 0,
+                            'fill' => '-1',
+                        ],
+                    ],
+                ],
+                'options' => [
+                    'layout' => ['padding' => ['top' => 12, 'right' => 18, 'left' => 10, 'bottom' => 8]],
+                    'plugins' => [
+                        'legend' => [
+                            'labels' => ['color' => '#cbd5e1', 'font' => ['size' => 11]],
+                        ],
+                    ],
+                    'scales' => [
+                        'x' => [
+                            'ticks' => ['color' => '#94a3b8', 'maxRotation' => 45, 'font' => ['size' => 10]],
+                            'grid' => ['color' => 'rgba(148, 163, 184, 0.10)'],
+                        ],
+                        'y' => [
+                            'position' => 'right',
+                            'ticks' => ['color' => '#e2e8f0', 'font' => ['size' => 11]],
+                            'grid' => ['color' => 'rgba(148, 163, 184, 0.14)'],
+                        ],
+                    ],
+                ],
+            ];
+
+            $resp = \Illuminate\Support\Facades\Http::timeout(20)->post('https://quickchart.io/chart', [
+                'version' => '3',
+                'width' => 920,
+                'height' => 440,
+                'backgroundColor' => '#0f172a',
+                'format' => 'png',
+                'chart' => $chartConfig,
+            ]);
+
+            if (!$resp->successful()) {
+                return null;
+            }
+
+            $chartImg = @imagecreatefromstring($resp->body());
+            if (!$chartImg) {
+                return null;
+            }
+
+            $w = imagesx($chartImg);
+            $h = imagesy($chartImg);
+            $headerH = 68;
+            $canvas = imagecreatetruecolor($w, $h + $headerH);
+
+            $bgHeader = imagecolorallocate($canvas, 15, 23, 42);
+            $borderCol = imagecolorallocate($canvas, 51, 65, 85);
+            $white = imagecolorallocate($canvas, 248, 250, 252);
+            $muted = imagecolorallocate($canvas, 148, 163, 184);
+            $accent = match ($bias) {
+                'BULLISH' => imagecolorallocate($canvas, 34, 197, 94),
+                'BEARISH' => imagecolorallocate($canvas, 239, 68, 68),
+                default   => imagecolorallocate($canvas, 234, 179, 8),
+            };
+
+            imagefilledrectangle($canvas, 0, 0, $w, $headerH, $bgHeader);
+            imageline($canvas, 0, $headerH - 1, $w, $headerH - 1, $borderCol);
+            imagecopy($canvas, $chartImg, 0, $headerH, 0, 0, $w, $h);
+
+            $dec = str_contains($forecast['symbol'], '-USD') ? 2 : 0;
+            $lastStr = number_format($forecast['last_close'], $dec);
+            $tgtStr  = number_format($forecast['target_close'], $dec);
+            $chgSign = $forecast['change_pct'] >= 0 ? '+' : '';
+
+            imagestring($canvas, 5, 22, 14, "KRONOS AI 5-DAY FORECAST: {$cleanSym}", $white);
+            imagestring($canvas, 4, 22, 38, "Last: Rp {$lastStr}  |  Target H+5: Rp {$tgtStr} ({$chgSign}{$forecast['change_pct']}%)  |  Bias: {$bias}", $accent);
+            imagestring($canvas, 2, $w - 235, 42, "Model: Kronos-small | Easy Cuan Bot", $muted);
+
+            ob_start();
+            imagepng($canvas, null, 8);
+            $pngData = ob_get_clean();
+
+            imagedestroy($chartImg);
+            imagedestroy($canvas);
+
+            $fileName = "charts/kronos_{$cleanSym}_" . time() . ".png";
+            Storage::disk('local')->put($fileName, $pngData);
+            return Storage::disk('local')->path($fileName);
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+
+    private function fetchStockbitChartResult(string $cleanSymbol, string $tf): ?array
+    {
+        $token = Cache::get('stockbit_bearer_token');
+        if (empty($token) && file_exists(storage_path('app/stockbit_token.json'))) {
+            $saved = json_decode((string) file_get_contents(storage_path('app/stockbit_token.json')), true);
+            if (!empty($saved['token']) && ($saved['expires_at'] ?? 0) > time()) {
+                $token = $saved['token'];
+                Cache::put('stockbit_bearer_token', $token, \Carbon\Carbon::createFromTimestamp($saved['expires_at']));
+            }
+        }
+        $token = $token ?: env('STOCKBIT_BEARER_TOKEN');
+        if (empty($token)) {
+            return null;
+        }
+
+        try {
+            $now = now('Asia/Jakarta');
+            if ($tf === '1H') {
+                $from = $now->format('Y-m-d');
+                $to   = $now->copy()->subDays(45)->format('Y-m-d');
+                $endpoint = "https://exodus.stockbit.com/chartbit/{$cleanSymbol}/price/intraday";
+                $query = ['from' => $from, 'to' => $to, 'timeframe' => '60m'];
+            } else {
+                $years = match ($tf) {
+                    '1M' => 10,
+                    '1W' => 5,
+                    default => 2,
+                };
+                $from = $now->format('Y-m-d');
+                $to   = $now->copy()->subYears($years)->format('Y-m-d');
+                $endpoint = "https://exodus.stockbit.com/chartbit/{$cleanSymbol}/price/daily";
+                $query = ['from' => $from, 'to' => $to, 'limit' => 2500];
+            }
+
+            $res = Http::withToken($token)
+                ->withOptions(['force_ip_resolve' => 'v4'])
+                ->withHeaders([
+                    'Origin'     => 'https://stockbit.com',
+                    'Referer'    => 'https://stockbit.com/',
+                    'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                ])
+                ->connectTimeout(5)
+                ->timeout(10)
+                ->get($endpoint, $query);
+
+            if ($res->failed()) {
+                return null;
+            }
+
+            $rawList = $res->json('data.chartbit')
+                ?? $res->json('data.prices')
+                ?? $res->json('data')
+                ?? [];
+
+            if (!is_array($rawList) || count($rawList) < 20) {
+                return null;
+            }
+
+            usort($rawList, function ($a, $b) {
+                $ta = $a['unixdate'] ?? $a['timestamp'] ?? strtotime($a['date'] ?? $a['datetime'] ?? '1970-01-01');
+                $tb = $b['unixdate'] ?? $b['timestamp'] ?? strtotime($b['date'] ?? $b['datetime'] ?? '1970-01-01');
+                return $ta <=> $tb;
+            });
+
+            if ($tf === '1W' || $tf === '1M') {
+                $grouped = [];
+                foreach ($rawList as $row) {
+                    $ts = isset($row['unixdate']) ? (int) $row['unixdate']
+                        : (isset($row['timestamp']) ? (int) $row['timestamp']
+                        : strtotime(($row['date'] ?? $row['datetime'] ?? '') . ' 16:00:00 Asia/Jakarta'));
+                    if ($ts <= 0) continue;
+
+                    $key = $tf === '1W'
+                        ? date('o-\WW', $ts)
+                        : date('Y-m', $ts);
+
+                    $o = (float) ($row['open'] ?? 0);
+                    $h = (float) ($row['high'] ?? 0);
+                    $l = (float) ($row['low'] ?? 0);
+                    $c = (float) ($row['close'] ?? 0);
+                    $v = (float) ($row['volume'] ?? 0);
+                    if ($c <= 0) continue;
+
+                    if (!isset($grouped[$key])) {
+                        $grouped[$key] = ['ts' => $ts, 'o' => $o ?: $c, 'h' => $h ?: $c, 'l' => $l ?: $c, 'c' => $c, 'v' => $v];
+                    } else {
+                        $grouped[$key]['ts'] = $ts;
+                        $grouped[$key]['h'] = max($grouped[$key]['h'], $h ?: $c);
+                        $grouped[$key]['l'] = min($grouped[$key]['l'], $l ?: $c);
+                        $grouped[$key]['c'] = $c;
+                        $grouped[$key]['v'] += $v;
+                    }
+                }
+
+                $timestamps = [];
+                $opens = []; $highs = []; $lows = []; $closes = []; $volumes = [];
+                foreach ($grouped as $g) {
+                    $timestamps[] = $g['ts'];
+                    $opens[]   = $g['o'];
+                    $highs[]   = $g['h'];
+                    $lows[]    = $g['l'];
+                    $closes[]  = $g['c'];
+                    $volumes[] = $g['v'];
+                }
+            } else {
+                $timestamps = [];
+                $opens = []; $highs = []; $lows = []; $closes = []; $volumes = [];
+                foreach ($rawList as $row) {
+                    $ts = isset($row['unixdate']) ? (int) $row['unixdate']
+                        : (isset($row['timestamp']) ? (int) $row['timestamp']
+                        : strtotime(($row['date'] ?? $row['datetime'] ?? '') . ' Asia/Jakarta'));
+                    $c = (float) ($row['close'] ?? 0);
+                    if ($ts <= 0 || $c <= 0) continue;
+
+                    $timestamps[] = $ts;
+                    $opens[]   = (float) ($row['open'] ?? $c);
+                    $highs[]   = (float) ($row['high'] ?? $c);
+                    $lows[]    = (float) ($row['low'] ?? $c);
+                    $closes[]  = $c;
+                    $volumes[] = (float) ($row['volume'] ?? 0);
+                }
+            }
+
+            if (count($closes) < 20) {
+                return null;
+            }
+
+            return [
+                'timestamp' => $timestamps,
+                'indicators' => [
+                    'quote' => [[
+                        'open'   => $opens,
+                        'high'   => $highs,
+                        'low'    => $lows,
+                        'close'  => $closes,
+                        'volume' => $volumes,
+                    ]],
+                ],
+            ];
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
 }
