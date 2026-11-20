@@ -690,6 +690,7 @@ $bot->onCommand('unpantau', function (\SergiX44\Nutgram\Nutgram $bot) {
 $bot->onCommand('setmenu', function (\SergiX44\Nutgram\Nutgram $bot) {
     $commands = [
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('brief', 'Morning Market Brief & IHSG Macro Radar'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('sesi1', 'Market Report Sesi 1 (Top Gainer, Asing, Rebound, Vol)'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('analisa', 'Analisa teknikal, chart & trading plan'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('forecast', 'Proyeksi harga 5 hari ke depan dengan Kronos AI'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('screener', 'Screener saham (Uptrend, Oversold, Breakout)'),
@@ -1509,4 +1510,118 @@ $bot->onCallbackQueryData('ritel:cal', function (Nutgram $bot) {
         parse_mode: ParseMode::HTML,
         reply_markup: $calKeyboard
     );
+});
+
+
+
+
+
+
+$bot->onCommand('sesi1', function (\SergiX44\Nutgram\Nutgram $bot) {
+    $waitMsg = $bot->sendMessage("⏳ <i>Menyusun Market Report Sesi 1 (IHSG, Top Mover, Foreign Flow, Rebound 3D & Lonjakan Volume)...</i>", parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML);
+    try {
+        $service = app(\App\Services\MarketSessionReportService::class);
+        $report = $service->generateReport(true);
+        $bot->editMessageText(
+            text: $report,
+            chat_id: $waitMsg->chat->id,
+            message_id: $waitMsg->message_id,
+            parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML
+        );
+    } catch (\Throwable $e) {
+        $bot->editMessageText(
+            text: "❌ Gagal menyusun Market Report Sesi 1: " . $e->getMessage(),
+            chat_id: $waitMsg->chat->id,
+            message_id: $waitMsg->message_id
+        );
+    }
+})->description('Market Report Sesi 1 (IHSG, Top Gainer/Loser, Foreign Flow, Rebound, Volume)');
+
+$bot->onCommand('Sesi1', function (\SergiX44\Nutgram\Nutgram $bot) {
+    $waitMsg = $bot->sendMessage("⏳ <i>Menyusun Market Report Sesi 1...</i>", parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML);
+    $report = app(\App\Services\MarketSessionReportService::class)->generateReport(true);
+    $bot->editMessageText(text: $report, chat_id: $waitMsg->chat->id, message_id: $waitMsg->message_id, parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML);
+});
+
+// Helper daftar perintah lengkap (/help & tombol Daftar Perintah)
+$sendFullHelp = function (\SergiX44\Nutgram\Nutgram $bot) {
+    $helpText = "📋 <b>DAFTAR LENGKAP PERINTAH BOT</b>\n"
+              . "━━━━━━━━━━━━━━━━━━━━\n"
+              . "🌅 <b>Market & Sektor:</b>\n"
+              . "• <code>/brief</code> — Morning Market Brief & Macro Radar\n"
+              . "• <code>/sesi1</code> — Market Report Sesi 1 (Gainer, Asing, Rebound, Vol)\n"
+              . "• <code>/sektor</code> — Peta Rotasi & Kinerja Indeks Sektoral\n"
+              . "• <code>/radar</code> — Radar Saham Potensial & Momentum\n\n"
+              . "📈 <b>Teknikal & Proyeksi AI:</b>\n"
+              . "• <code>/analisa KODE</code> — Chart teknikal, sinyal & lot sizing\n"
+              . "• <code>/mtf KODE</code> — Multi-Timeframe Confluence (1H/1D/1W)\n"
+              . "• <code>/forecast KODE</code> (atau <code>/ai KODE</code>) — Proyeksi 5D Kronos AI\n\n"
+              . "💎 <b>Fundamental & Valuasi:</b>\n"
+              . "• <code>/valuasi KODE</code> — Fair Value (Graham, EPV, DCF) & MoS\n"
+              . "• <code>/audit KODE</code> — Piotroski F-Score Quality Audit\n"
+              . "• <code>/banding KODE1 KODE2</code> — Komparasi peer satu sektor\n\n"
+              . "🔍 <b>Screener & Broker Flow:</b>\n"
+              . "• <code>/screener</code> — Screener sinyal teknikal & fundamental\n"
+              . "• <code>/dividen</code> — Screener saham dividen yield tinggi\n"
+              . "• <code>/volume</code> — Deteksi lonjakan volume tidak wajar\n"
+              . "• <code>/akumulasi</code> — Deteksi saham akumulasi bandar\n"
+              . "• <code>/topritel</code> — Screener Top Retail Jualan (Stockbit)\n\n"
+              . "🔔 <b>Watchlist & Pengaturan:</b>\n"
+              . "• <code>/watchlist</code> — Lihat daftar saham yang dipantau\n"
+              . "• <code>/pantau KODE</code> — Tambah saham ke alert otomatis\n"
+              . "• <code>/unpantau KODE</code> — Hapus saham dari watchlist\n"
+              . "• <code>/settoken TOKEN</code> — Update Bearer Token Stockbit\n"
+              . "• <code>/setmenu</code> — Segarkan tombol menu perintah bot\n\n"
+              . "💡 <i>Tips: Ketik langsung kode saham (misal <code>BBRI</code>) untuk analisa cepat, atau paste JWT token Stockbit langsung di chat.</i>";
+
+    $bot->sendMessage($helpText, parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML);
+};
+
+$bot->onCommand('help', $sendFullHelp);
+$bot->onCommand('Help', $sendFullHelp);
+
+$bot->onCallbackQueryData('menu:help', function (\SergiX44\Nutgram\Nutgram $bot) use ($sendFullHelp) {
+    $bot->answerCallbackQuery();
+    $sendFullHelp($bot);
+});
+
+$bot->onCallbackQueryData('quick:brief', function (\SergiX44\Nutgram\Nutgram $bot, \App\Services\MarketBriefService $briefService) {
+    $bot->answerCallbackQuery(text: "⏳ Memuat Market Brief...");
+    try {
+        $brief = $briefService->generateBrief();
+        $msg = "🌅 <b>MARKET BRIEF & MACRO RADAR</b>\n" . $briefService->formatTelegramMessage($brief);
+        $bot->sendMessage($msg, parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML);
+    } catch (\Throwable $e) {
+        $bot->sendMessage("❌ Gagal memuat Market Brief: " . $e->getMessage());
+    }
+});
+
+// UNKNOWN_COMMAND_FALLBACK: Tangani perintah atau pesan yang tidak dikenali
+$bot->fallback(function (\SergiX44\Nutgram\Nutgram $bot) {
+    if ($bot->callbackQuery() !== null) {
+        $bot->answerCallbackQuery();
+        return;
+    }
+
+    $text = trim((string) ($bot->message()?->text ?? ""));
+    if ($text === "") {
+        return;
+    }
+
+    if (str_starts_with($text, "/")) {
+        $cmd = htmlspecialchars(explode(" ", $text)[0]);
+        $msg = "❓ Perintah <code>{$cmd}</code> tidak dikenali.\n\n"
+             . "Gunakan <b>/help</b> untuk melihat daftar perintah yang tersedia, atau langsung ketik kode saham (contoh: <code>BBRI</code>) untuk analisa cepat.";
+    } else {
+        $msg = "❓ Format pesan tidak dikenali.\n\n"
+             . "Ketik kode saham (contoh: <code>BBRI</code>) untuk analisa chart & sinyal, atau ketik <b>/help</b> untuk melihat semua fitur.";
+    }
+
+    $keyboard = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup::make()
+        ->addRow(
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make("📋 Daftar Perintah", callback_data: "menu:help"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make("🌅 Market Brief", callback_data: "quick:brief")
+        );
+
+    $bot->sendMessage($msg, parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML, reply_markup: $keyboard);
 });

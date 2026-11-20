@@ -58,15 +58,30 @@ Artisan::command('report:morning-brief', function (Nutgram $bot, MarketBriefServ
 })->purpose('Kirim otomatis Morning Market Brief sebelum pembukaan bursa');
 
 /**
- * Command: Kirim Rekap Sore Top Retail Jualan (16:35 WIB)
+ * Command: Kirim Rekap Sore Top Retail Jualan (17:30 WIB)
  */
-Artisan::command('report:top-retail', function (Nutgram $bot, StockScreenerService $screener) use ($resolveOwnerChatId) {
+Artisan::command('report:top-retail', function (Nutgram $bot, StockScreenerService $screener, MarketBriefService $briefService) use ($resolveOwnerChatId) {
     $chatId = $resolveOwnerChatId();
     if (!$chatId) {
         $this->error('CHAT_ID belum tersimpan. Kirim pesan apa saja ke bot Telegram sekali untuk mendaftarkan chat_id.');
         return;
     }
 
+        // 1. Kirim Evening Market Brief terlebih dahulu (17:30 WIB)
+    try {
+        $brief = $briefService->generateBrief();
+        $briefMsg = "🌇 <b>EVENING MARKET BRIEF (17:30 WIB)</b>\n" . $briefService->formatTelegramMessage($brief);
+        $keyboard = InlineKeyboardMarkup::make()
+            ->addRow(
+                InlineKeyboardButton::make("🧭 Radar Sektor", callback_data: "quick:sektor"),
+                InlineKeyboardButton::make("🏦 Akumulasi Bandar", callback_data: "quick:akumulasi")
+            );
+        $bot->sendMessage($briefMsg, chat_id: $chatId, parse_mode: ParseMode::HTML, reply_markup: $keyboard);
+    } catch (\Throwable $be) {
+        $this->warn("Gagal mengirim Evening Market Brief: " . $be->getMessage());
+    }
+
+    // 2. Lanjut kirim Rekap Sore: Top Retail Jualan
     $universe = [
         'BBCA', 'BBRI', 'BMRI', 'BBNI', 'BRIS', 'BBTN', 'BDMN', 'BNGA',
         'TLKM', 'ISAT', 'EXCL', 'MTEL', 'TOWR',
@@ -101,7 +116,7 @@ Artisan::command('report:top-retail', function (Nutgram $bot, StockScreenerServi
 
         if (isset($result['error']) && $result['error'] === 'TOKEN_EXPIRED') {
             $bot->sendMessage(
-                "⚠️ <b>AUTO REPORT TOP RETAIL (16:35 WIB)</b>\nToken Stockbit kedaluwarsa. Perbarui dengan <code>/settoken &lt;token_baru&gt;</code> agar rekap sore berjalan otomatis.",
+                "⚠️ <b>AUTO REPORT TOP RETAIL (17:30 WIB)</b>\nToken Stockbit kedaluwarsa. Perbarui dengan <code>/settoken &lt;token_baru&gt;</code> agar rekap sore berjalan otomatis.",
                 chat_id: $chatId,
                 parse_mode: ParseMode::HTML
             );
@@ -136,7 +151,22 @@ Artisan::command('report:top-retail', function (Nutgram $bot, StockScreenerServi
         $lines[] = "</pre>";
         $lines[] = "💡 <i>Ketik /topritel untuk melihat tanggal bursa lainnya.</i>";
 
-        $bot->sendMessage(implode("\n", $lines), chat_id: $chatId, parse_mode: ParseMode::HTML);
+        $top10 = array_slice($result, 0, 10);
+$keyboard = InlineKeyboardMarkup::make();
+foreach (array_chunk($top10, 5) as $chunk) {
+    $rowButtons = [];
+    foreach ($chunk as $item) {
+        $s = strtoupper(trim((string) ($item['symbol'] ?? '')));
+        if ($s !== '' && $s !== '-') {
+            $rowButtons[] = InlineKeyboardButton::make("📊 {$s}", callback_data: "chart:{$s}");
+        }
+    }
+    if (!empty($rowButtons)) {
+        $keyboard->addRow(...$rowButtons);
+    }
+}
+
+$bot->sendMessage(implode("\n", $lines), chat_id: $chatId, parse_mode: ParseMode::HTML, reply_markup: $keyboard);
         $this->info("Rekap Top Retail berhasil dikirim ke {$chatId}");
     } catch (\Throwable $e) {
         $this->error('Gagal mengirim Rekap Top Retail: ' . $e->getMessage());
@@ -152,7 +182,7 @@ Schedule::command('report:morning-brief')
 
 Schedule::command('report:top-retail')
     ->weekdays()
-    ->at('16:35')
+    ->at('17:30')
     ->timezone('Asia/Jakarta')
     ->withoutOverlapping();
 
@@ -200,7 +230,7 @@ Artisan::command('report:check-stockbit-token', function (Nutgram $bot) use ($re
         $msg = "⚠️ <b>PENGINGAT TOKEN STOCKBIT</b>\n"
              . "━━━━━━━━━━━━━━━━━━━━\n"
              . "Bearer Token Stockbit Anda {$statusText}\n\n"
-             . "Segera perbarui token agar fitur <code>/topritel</code> dan auto-rekap sore (16:35 WIB) tetap berjalan lancar:\n"
+             . "Segera perbarui token agar fitur <code>/topritel</code> dan auto-rekap sore (17:30 WIB) tetap berjalan lancar:\n"
              . "👉 <code>/settoken &lt;token_baru&gt;</code>";
 
         $bot->sendMessage($msg, chat_id: $chatId, parse_mode: ParseMode::HTML);
@@ -215,3 +245,11 @@ Schedule::command('report:check-stockbit-token')
     ->everyFifteenMinutes()
     ->timezone('Asia/Jakarta')
     ->withoutOverlapping();
+
+
+\Illuminate\Support\Facades\Schedule::call(function () use ($resolveOwnerChatId) {
+    $chatId = $resolveOwnerChatId();
+    if (!$chatId) return;
+    $report = app(\App\Services\MarketSessionReportService::class)->generateReport(true);
+    app(\SergiX44\Nutgram\Nutgram::class)->sendMessage($report, chat_id: $chatId, parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML);
+})->name('report:sesi1')->weekdays()->at('12:05')->timezone('Asia/Jakarta')->withoutOverlapping();
