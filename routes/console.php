@@ -198,6 +198,22 @@ Artisan::command('report:check-stockbit-token', function (Nutgram $bot) use ($re
     $token = Cache::get('stockbit_bearer_token');
     $expTs = Cache::get('stockbit_token_expires_at');
 
+    // Auto-fallback ke file JSON jika cache sempat terhapus
+    if (!$token || !$expTs) {
+        $path = storage_path('app/stockbit_token.json');
+        if (file_exists($path)) {
+            $saved = json_decode(file_get_contents($path), true);
+            if (!empty($saved['expires_at'])) {
+                $expTs = (int) $saved['expires_at'];
+                Cache::forever('stockbit_token_expires_at', $expTs);
+            }
+            if (!empty($saved['token']) && $expTs && time() < $expTs) {
+                $token = $saved['token'];
+                Cache::put('stockbit_bearer_token', $token, \Carbon\Carbon::createFromTimestamp($expTs));
+            }
+        }
+    }
+
     // Jika expTs belum tercatat (token lama sebelum update), ekstrak dari JWT yang tersimpan
     if ($token && !$expTs) {
         $parts = explode('.', $token);

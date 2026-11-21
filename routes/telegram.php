@@ -98,13 +98,17 @@ $buildConfluenceStrategy = function (
     return "⚖️ Harga bergerak konsolidasi/transisi. Titik pantau: akumulasi dekat <b>{$supportZone}</b> atau tunggu breakout R1 (<b>{$r1Fmt}</b>) bervolume.";
 };
 
-$sendAnalysisChart = function (Nutgram $bot, string $ticker, StockAnalysisService $service, float $maxRisk = 1000000, string $timeframe = '1D') use ($formatBrokerFlowBlock, $buildConfluenceStrategy) {
+$sendAnalysisChart = function (Nutgram $bot, string $ticker, StockAnalysisService $service, ?float $maxRisk = null, string $timeframe = '1D') use ($formatBrokerFlowBlock, $buildConfluenceStrategy) {
+    $maxRisk = ($maxRisk !== null && $maxRisk > 0)
+        ? $maxRisk
+        : \App\Models\UserRiskProfile::maxRiskFor($bot->chatId());
     $ticker = strtoupper(htmlspecialchars(trim($ticker)));
     $bot->sendMessage("⏳ Sedang menganalisa <b>{$ticker}</b>...", parse_mode: ParseMode::HTML);
 
     try {
         $tf = strtoupper(trim($timeframe));
-        $data = $service->analyze($ticker, $maxRisk, $tf);
+        $maxCapital = \App\Models\UserRiskProfile::forChat($bot->chatId())?->capital;
+        $data = $service->analyze($ticker, $maxRisk, $tf, $maxCapital);
 
         $trend = "🟡 Sideways / Konsolidasi";
         if ($data['ma200'] && $data['price'] > $data['ma50'] && $data['ma50'] > $data['ma200']) {
@@ -274,29 +278,132 @@ $bot->middleware(function (Nutgram $bot, $next) {
 });
 
 $bot->onCommand('start', function (Nutgram $bot) {
-    $msg = "Halo! Saya <b>Easy Cuan</b>, bot analisis teknikal & fundamental saham BEI.\n\n"
-        . "<b>📊 Teknikal & Trading Plan:</b>\n"
-        . "📈 <code>/analisa BBCA</code> — Chart & Trading Plan (Risk Rp 1 Jt)\n"
-        . "🧮 <code>/analisa BBCA 500000</code> — Chart & Custom Max Risk\n\n"
-        . "<b>🔍 Screener Saham:</b>\n"
-        . "🔎 <code>/screener</code> — Default (PER &lt; 10, PBV &lt; 5)\n"
-        . "🎯 <code>/screener 8 1.5</code> — Custom PER &amp; PBV\n"
-        . "🛡️ <code>/screener 10 2 1</code> — Custom PER, PBV &amp; DER\n"
-        . "💰 <code>/dividen 10</code> — Khusus Dividen &gt;= 10%\n"
-        . "🔥 <code>/volume</code> — Lonjakan Volume &gt;= 1.5x\n"
+    $maxRisk = \App\Models\UserRiskProfile::maxRiskFor($bot->chatId());
+    $riskLabel = \App\Models\UserRiskProfile::formatShort($maxRisk);
+
+    $msg = "Halo! Saya <b>Easy Cuan</b>, asisten analisis teknikal, fundamental &amp; bandarmologi saham BEI.\n\n"
+        . "<b>🌍 Market &amp; Sektor:</b>\n"
+        . "🌅 <code>/brief</code> — Morning Brief &amp; IHSG Macro\n"
+        . "🧭 <code>/sektor</code> — Rotasi &amp; Momentum 8 Sektor\n"
+        . "📡 <code>/radar</code> — Intraday Sweep &amp; Unusual Vol (15m)\n\n"
+        . "<b>📊 Teknikal &amp; Trading Plan:</b>\n"
+        . "📈 <code>/analisa BBCA</code> — Chart &amp; Plan (Risk <b>{$riskLabel}</b>)\n"
+        . "🧮 <code>/analisa BBCA 500000</code> — Plan Custom Max Risk\n"
+        . "⚙️ <code>/setrisk</code> — Atur Modal &amp; Risk (Aktif: <b>{$riskLabel}</b>)\n\n"
+        . "<b>🏦 Bandarmologi &amp; Flow:</b>\n"
+        . "🕵️ <code>/brokersum BBRI</code> — Broker Summary Real-Time\n"
+        . "📉 <code>/topritel</code> — Top Retail Jualan\n"
         . "🏦 <code>/akumulasi</code> — Deteksi Akumulasi (VSA/OBV)\n"
-        . "📡 <code>/radar</code> — Bandar Intraday Sweep &amp; Unusual Volume (15m)\n"
-        . "📉 <code>/topritel</code> — Screener Top Retail Jualan (Broker Summary)\n\n"
+        . "🔥 <code>/volume</code> — Lonjakan Volume &gt;= 1.5x\n\n"
+        . "<b>🔍 Screener Fundamental:</b>\n"
+        . "🔎 <code>/screener</code> — Default (PER &lt; 10, PBV &lt; 5)\n"
+        . "🎯 <code>/screener 10 2 1</code> — Custom PER, PBV, [DER]\n"
+        . "💰 <code>/dividen 10</code> — Dividend Yield &gt;= 10%\n\n"
         . "<b>💎 Valuasi, Komparasi &amp; Audit:</b>\n"
-        . "🌅 <code>/brief</code> — Morning Market Brief &amp; IHSG Macro Radar\n"
-        . "🧭 <code>/sektor</code> — Radar Rotasi & Momentum 8 Sektor BEI\n"
-        . "⚖️ <code>/banding BBRI BMRI BBCA</code> — Komparasi Head-to-Head\n"
-        . "💎 <code>/valuasi BBRI</code> — Nilai Wajar &amp; Margin of Safety\n"
-        . "🕵️ <code>/audit ASII</code> — Kualitas Laba &amp; Piotroski F-Score\n\n"
+        . "💎 <code>/valuasi BBRI</code> — Nilai Wajar &amp; MoS\n"
+        . "⚖️ <code>/banding BBRI BMRI BBCA</code> — Head-to-Head\n"
+        . "📑 <code>/audit ASII</code> — Kualitas Laba &amp; F-Score\n\n"
         . "<b>🔔 Watchlist &amp; Alert:</b>\n"
         . "📋 <code>/watchlist</code> | ➕ <code>/pantau BBRI</code> | ➖ <code>/unpantau BBRI</code>";
 
     $bot->sendMessage($msg, parse_mode: ParseMode::HTML);
+});
+
+$sendRiskProfile = function (Nutgram $bot, ?string $notice = null): void {
+    $profile = \App\Models\UserRiskProfile::forChat($bot->chatId());
+    $maxRisk = \App\Models\UserRiskProfile::maxRiskFor($bot->chatId());
+    $riskRp = \App\Models\UserRiskProfile::formatRp($maxRisk);
+
+    $detail = $profile && $profile->capital && $profile->risk_percent
+        ? "💼 Modal: <b>" . \App\Models\UserRiskProfile::formatRp($profile->capital) . "</b>\n"
+            . "📐 Risk/Trade: <b>" . rtrim(rtrim(number_format($profile->risk_percent, 2, ',', '.'), '0'), ',') . "%</b>\n"
+        : "💼 Mode: <b>Nominal Langsung" . ($profile ? '' : ' (Default)') . "</b>\n";
+
+    $header = $notice ? "{$notice}\n\n" : '';
+    $msg = $header
+        . "⚙️ <b>PENGATURAN RISK MANAGEMENT</b>\n"
+        . "━━━━━━━━━━━━━━━━━━━━\n"
+        . $detail
+        . "🛡️ Max Risk Aktif: <b>{$riskRp}</b> / trade\n\n"
+        . "<b>Cara Mengubah:</b>\n"
+        . "• <code>/setrisk 50000000 1</code> — Modal Rp 50 Jt, Risk 1%\n"
+        . "• <code>/setrisk 500000</code> — Set Max Risk langsung Rp 500 Rb\n"
+        . "• <code>/setrisk reset</code> — Kembali ke default Rp 1 Jt\n\n"
+        . "Atau pilih preset cepat di bawah:";
+
+    $keyboard = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup::make()
+        ->addRow(
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('Rp 250 Rb', callback_data: 'setrisk:preset:250000'),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('Rp 500 Rb', callback_data: 'setrisk:preset:500000'),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('Rp 1 Jt', callback_data: 'setrisk:preset:1000000'),
+        )
+        ->addRow(
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('Rp 2 Jt', callback_data: 'setrisk:preset:2000000'),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('Rp 5 Jt', callback_data: 'setrisk:preset:5000000'),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('🔄 Reset', callback_data: 'setrisk:reset'),
+        );
+
+    $bot->sendMessage($msg, parse_mode: ParseMode::HTML, reply_markup: $keyboard);
+};
+
+$bot->onCommand('setrisk {args}', function (Nutgram $bot, string $args) use ($sendRiskProfile) {
+    $trimmed = trim($args);
+    if (strtolower($trimmed) === 'reset') {
+        \App\Models\UserRiskProfile::resetForChat($bot->chatId());
+        $sendRiskProfile($bot, '✅ Pengaturan risk dikembalikan ke default (Rp 1 Jt).');
+        return;
+    }
+
+    $parts = preg_split('/\s+/', $trimmed);
+
+    if (count($parts) >= 2) {
+        $capital = (float) preg_replace('/[^0-9]/', '', $parts[0]);
+        $pct = (float) str_replace(',', '.', preg_replace('/[^0-9.,]/', '', $parts[1]));
+
+        if ($capital < 100000 || $pct <= 0 || $pct > 100) {
+            $bot->sendMessage(
+                "⚠️ Input tidak valid. Modal minimal Rp 100.000 dan persentase risk antara 0.1% - 100%.\nContoh: <code>/setrisk 50000000 1.5</code>",
+                parse_mode: ParseMode::HTML
+            );
+            return;
+        }
+
+        $maxRisk = round($capital * ($pct / 100));
+        \App\Models\UserRiskProfile::saveForChat($bot->chatId(), $maxRisk, $capital, $pct);
+        $sendRiskProfile($bot, '✅ Profil modal &amp; risk berhasil disimpan.');
+        return;
+    }
+
+    $directRisk = (float) preg_replace('/[^0-9]/', '', $parts[0] ?? '');
+    if ($directRisk < 10000) {
+        $bot->sendMessage(
+            "⚠️ Nominal Max Risk minimal Rp 10.000.\nContoh: <code>/setrisk 500000</code> atau <code>/setrisk 50000000 1</code>",
+            parse_mode: ParseMode::HTML
+        );
+        return;
+    }
+
+    \App\Models\UserRiskProfile::saveForChat($bot->chatId(), $directRisk);
+    $sendRiskProfile($bot, '✅ Max Risk default berhasil diperbarui.');
+});
+
+$bot->onCommand('setrisk', function (Nutgram $bot) use ($sendRiskProfile) {
+    $sendRiskProfile($bot);
+});
+
+$bot->onCallbackQueryData('setrisk:preset:{amount}', function (Nutgram $bot, string $amount) use ($sendRiskProfile) {
+    $val = (float) preg_replace('/[^0-9]/', '', $amount);
+    if ($val >= 10000) {
+        \App\Models\UserRiskProfile::saveForChat($bot->chatId(), $val);
+        $bot->answerCallbackQuery(text: 'Max Risk diset ke ' . \App\Models\UserRiskProfile::formatShort($val));
+        $sendRiskProfile($bot, '✅ Max Risk diubah ke <b>' . \App\Models\UserRiskProfile::formatRp($val) . '</b>.');
+    }
+});
+
+$bot->onCallbackQueryData('setrisk:reset', function (Nutgram $bot) use ($sendRiskProfile) {
+    \App\Models\UserRiskProfile::resetForChat($bot->chatId());
+    $bot->answerCallbackQuery(text: 'Risk direset ke default Rp 1 Jt');
+    $sendRiskProfile($bot, '✅ Pengaturan risk dikembalikan ke default (Rp 1 Jt).');
 });
 
 // =========================================================================
@@ -430,6 +537,40 @@ $renderBrokerSummary = function (\SergiX44\Nutgram\Nutgram $bot, string $sym, st
     $msg .= "📡 <b>Sumber:</b> 🟢 Stockbit Real-Time ({$nowWib} WIB)\n";
     $msg .= "━━━━━━━━━━━━━━━━━━━━\n";
     $msg .= "{$statusEmoji} <b>Status Bandar:</b> {$statusRaw}\n";
+
+    $bd = $res['bandar'] ?? null;
+    if (!empty($bd) && is_array($bd)) {
+        $rows = [
+            'Top 1' => $bd['top1'] ?? null,
+            'Top 3' => $bd['top3'] ?? null,
+            'Top 5' => $bd['top5'] ?? null,
+            'Avg'   => $bd['avg'] ?? null,
+        ];
+        $table  = "Level |  Rp(B) |    %  | Acc/Dist\n";
+        $table .= "------+--------+-------+----------\n";
+        foreach ($rows as $label => $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+            $rpB = ((float) ($item['amount'] ?? 0)) / 1e9;
+            $pct = (float) ($item['percent'] ?? 0);
+            $ad  = (string) ($item['accdist'] ?? 'Neutral');
+            $rpStr  = ($rpB >= 0 ? '+' : '') . number_format($rpB, 1);
+            $pctStr = ($pct >= 0 ? '+' : '') . number_format($pct, 1);
+            $table .= sprintf("%-5s | %6s | %5s | %s\n", $label, $rpStr, $pctStr, $ad);
+        }
+
+        $bAd = (string) ($bd['broker_accdist'] ?? 'Neutral');
+        $bEmoji = str_contains(strtolower($bAd), 'acc') ? '🟢' : (str_contains(strtolower($bAd), 'dist') ? '🔴' : '🟡');
+        $bDiff = (int) ($bd['broker_diff'] ?? 0);
+        $netVolFmt = number_format((float) ($bd['net_vol'] ?? 0), 0);
+        $netValFmt = $fmtIdrShort((float) ($bd['net_val'] ?? 0));
+        $avgPriceFmt = number_format((float) ($bd['avg_price'] ?? 0), 0);
+
+        $msg .= "<pre>" . htmlspecialchars(rtrim($table)) . "</pre>\n";
+        $msg .= "{$bEmoji} <b>Broker Acc/Dist:</b> {$bAd} (#{$bDiff})\n";
+        $msg .= "📦 <b>Net Vol:</b> {$netVolFmt} lot | <b>Val:</b> {$netValFmt} | <b>Avg:</b> Rp {$avgPriceFmt}\n";
+    }
     $msg .= "📊 <b>Partisipan:</b> {$res['buyer_count']} Buyer vs {$res['seller_count']} Seller\n";
     $msg .= "💰 <b>Net Top 5:</b> <b>" . $fmtIdrShort((float) $res['net_top5']) . "</b>\n\n";
 
@@ -481,7 +622,7 @@ $sendBrokerMenu = function (\SergiX44\Nutgram\Nutgram $bot, string $rawSym, bool
 
     $kb = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup::make()
         ->addRow(
-            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('⚡ Hari Ini (1D)', callback_data: "bsrun:{$sym}:1D"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make(now('Asia/Jakarta')->isWeekend() ? '⚡ Terakhir (1D)' : '⚡ Hari Ini (1D)', callback_data: "bsrun:{$sym}:1D"),
             \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('📆 7 Hari (1W)', callback_data: "bsrun:{$sym}:1W"),
             \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('🗓 30 Hari (1M)', callback_data: "bsrun:{$sym}:1M")
         )
@@ -519,13 +660,17 @@ $bot->onCallbackQueryData('bsmenu:{sym}', function (\SergiX44\Nutgram\Nutgram $b
 // Callback: Preset 1D / 1W / 1M
 $bot->onCallbackQueryData('bsrun:{sym}:{preset}', function (\SergiX44\Nutgram\Nutgram $bot, string $sym, string $preset) use ($renderBrokerSummary) {
     $bot->answerCallbackQuery(text: "⏳ Memuat data {$sym} ({$preset})...");
-    $to = now('Asia/Jakarta')->format('Y-m-d');
+    $toDt = now('Asia/Jakarta');
+    while ($toDt->isWeekend()) {
+        $toDt->subDay();
+    }
+    $to = $toDt->format('Y-m-d');
     $from = match ($preset) {
-        '1W' => now('Asia/Jakarta')->subDays(7)->format('Y-m-d'),
-        '1M' => now('Asia/Jakarta')->subDays(30)->format('Y-m-d'),
+        '1W' => $toDt->copy()->subDays(7)->format('Y-m-d'),
+        '1M' => $toDt->copy()->subDays(30)->format('Y-m-d'),
         default => $to,
     };
-    $renderBrokerSummary($bot, $sym, $from, $to, true);
+    $renderBrokerSummary($bot, $sym, $from, $to, false);
 });
 
 // Callback: Buka kalender bulan berjalan
@@ -536,7 +681,7 @@ $bot->onCallbackQueryData('bscal:open:{sym}', function (\SergiX44\Nutgram\Nutgra
 
     $now = now('Asia/Jakarta');
     $kb = $buildBrokerCalendar($sym, $now->year, $now->month, null);
-    $bot->editMessageText(
+    $bot->sendMessage(
         "📅 <b>PILIH TANGGAL BROKER SUMMARY: {$sym}</b>\n"
         . "━━━━━━━━━━━━━━━━━━━━\n"
         . "1️⃣ Klik <b>Tanggal Mulai (From)</b> pada kalender di bawah.\n"
@@ -747,18 +892,19 @@ $bot->onCallbackQueryData('forecast:{ticker}', function (Nutgram $bot, string $t
 $bot->onCommand('analisa {args}', function (Nutgram $bot, string $args, StockAnalysisService $service) use ($sendAnalysisChart) {
     $parts = preg_split('/\s+/', trim($args));
     $sym = $parts[0] ?? '';
-    $cleanRisk = isset($parts[1]) ? (float) preg_replace('/[^0-9]/', '', $parts[1]) : 1000000;
-    $sendAnalysisChart($bot, $sym, $service, $cleanRisk > 0 ? $cleanRisk : 1000000);
+    $defaultRisk = \App\Models\UserRiskProfile::maxRiskFor($bot->chatId());
+    $cleanRisk = isset($parts[1]) ? (float) preg_replace('/[^0-9]/', '', $parts[1]) : $defaultRisk;
+    $sendAnalysisChart($bot, $sym, $service, $cleanRisk > 0 ? $cleanRisk : $defaultRisk);
 });
 
 $bot->onCallbackQueryData('chart:{ticker}', function (Nutgram $bot, string $ticker, StockAnalysisService $service) use ($sendAnalysisChart) {
     $bot->answerCallbackQuery(text: "Memuat chart {$ticker}...");
-    $sendAnalysisChart($bot, $ticker, $service, 1000000);
+    $sendAnalysisChart($bot, $ticker, $service, \App\Models\UserRiskProfile::maxRiskFor($bot->chatId()));
 });
 
 $bot->onCallbackQueryData('analisa:{ticker}', function (Nutgram $bot, string $ticker, StockAnalysisService $service) use ($sendAnalysisChart) {
     $bot->answerCallbackQuery(text: "Memuat chart {$ticker}...");
-    $sendAnalysisChart($bot, $ticker, $service, 1000000);
+    $sendAnalysisChart($bot, $ticker, $service, \App\Models\UserRiskProfile::maxRiskFor($bot->chatId()));
 });
 
 $runScreener = function (
@@ -1044,28 +1190,44 @@ $bot->onCommand('unpantau', function (\SergiX44\Nutgram\Nutgram $bot) {
 // Daftarkan menu perintah resmi ke server Telegram
 $bot->onCommand('setmenu', function (\SergiX44\Nutgram\Nutgram $bot) {
     $commands = [
+        // Market & Sektor
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('brief', 'Morning Market Brief & IHSG Macro Radar'),
-        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('sesi1', 'Market Report Sesi 1 (Top Gainer, Asing, Rebound, Vol)'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('sesi1', 'Market Report Sesi 1 (Gainer, Asing, Rebound, Vol)'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('sektor', 'Rotasi & Momentum 8 Sektor BEI'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('radar', 'Intraday Sweep & Unusual Vol (15m)'),
+
+        // Teknikal, Trading Plan & AI
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('analisa', 'Analisa teknikal, chart & trading plan'),
-        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('forecast', 'Proyeksi harga 5 hari ke depan dengan Kronos AI'),
-        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('screener', 'Screener saham (Uptrend, Oversold, Breakout)'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('setrisk', 'Atur Modal & Max Risk default per trade'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('mtf', 'Multi-Timeframe Confluence (1H/1D/1W)'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('forecast', 'Proyeksi harga 5 hari ke depan (Kronos AI)'),
+
+        // Bandarmologi & Flow
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('brokersum', 'Broker Summary & Bandar Detector Real-Time'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('topritel', 'Screener Top Retail Jualan (Stockbit)'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('akumulasi', 'Deteksi saham akumulasi bandar (VSA/OBV)'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('volume', 'Deteksi lonjakan volume >= 1.5x'),
+
+        // Screener Fundamental
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('screener', 'Screener fundamental (PER, PBV, DER)'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('dividen', 'Screener saham dividen yield tinggi'),
-        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('volume', 'Deteksi lonjakan volume hari ini'),
-        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('akumulasi', 'Deteksi saham akumulasi bandar'),
-        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('topritel', 'Screener Top Retail Jualan (Broker Summary)'),
-        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('brokersum', 'Broker Summary & Bandar Detector (Kalender)'),
-        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('settoken', 'Update Bearer Token Stockbit'),
+
+        // Valuasi, Komparasi & Audit
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('valuasi', 'Nilai wajar intrinsik (Graham, EPV, DCF) & MoS'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('banding', 'Komparasi head-to-head emiten satu sektor'),
-        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('valuasi', 'Nilai wajar intrinsik & Margin of Safety'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('audit', 'Audit kualitas laba & Piotroski F-Score'),
+
+        // Watchlist & Pengaturan
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('watchlist', 'Lihat daftar saham yang dipantau'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('pantau', 'Tambah saham ke watchlist alert'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('unpantau', 'Hapus saham dari watchlist'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('settoken', 'Update Bearer Token Stockbit'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('help', 'Daftar lengkap perintah Easy Cuan'),
     ];
     $bot->deleteMyCommands();
     $bot->setMyCommands($commands);
     $bot->setMyCommands($commands, scope: new \SergiX44\Nutgram\Telegram\Types\Command\BotCommandScopeAllPrivateChats());
-    $bot->sendMessage("✅ Menu perintah (/) berhasil diperbarui!");
+    $bot->sendMessage("✅ Menu perintah (/) berhasil diperbarui (" . count($commands) . " perintah)!");
 });
 
 
@@ -1073,12 +1235,13 @@ $bot->onCallbackQueryData('tf:{ticker}:{tf}:{risk}', function (Nutgram $bot, str
     $service = app(StockAnalysisService::class);
     $tf = strtoupper(trim($tf));
     $cleanSym = strtoupper(trim($ticker));
-    $maxRisk = (float) $risk > 0 ? (float) $risk : 1000000;
+    $maxRisk = (float) $risk > 0 ? (float) $risk : \App\Models\UserRiskProfile::maxRiskFor($bot->chatId());
 
     $bot->answerCallbackQuery(text: "⏳ Memuat chart {$cleanSym} ({$tf})...");
 
     try {
-        $data = $service->analyze($cleanSym, $maxRisk, $tf);
+        $maxCapital = \App\Models\UserRiskProfile::forChat($bot->chatId())?->capital;
+        $data = $service->analyze($cleanSym, $maxRisk, $tf, $maxCapital);
 
         $trend = "🟡 Sideways / Konsolidasi";
         if ($data['ma200'] && $data['price'] > $data['ma50'] && $data['ma50'] > $data['ma200']) {
@@ -1493,19 +1656,34 @@ $runSektor = function (Nutgram $bot) {
         }
 
         $keyboard = InlineKeyboardMarkup::make();
-        $row1 = [
-            InlineKeyboardButton::make("📊 Chart {$topLeaderSym}", callback_data: "chart:{$topLeaderSym}"),
-        ];
-        if ($secondLeaderSym) {
-            $row1[] = InlineKeyboardButton::make("📊 Chart {$secondLeaderSym}", callback_data: "chart:{$secondLeaderSym}");
-        }
-        $keyboard->addRow(...$row1);
 
-        if (count($topMembers) >= 2) {
-            $tickersStr = implode(' ', array_slice($topMembers, 0, 4));
-            $keyboard->addRow(
-                InlineKeyboardButton::make("⚖️ Bandingkan {$topSector['sector']}", callback_data: "banding_list:{$tickersStr}")
-            );
+        // 1. Tombol Chart semua leader sektor (grid 2x4)
+        $leaderBtns = [];
+        $seenLeaders = [];
+        foreach ($sectors as $sec) {
+            $sym = trim((string) ($sec['leader']['symbol'] ?? ''));
+            if ($sym === '' || isset($seenLeaders[$sym])) {
+                continue;
+            }
+            $seenLeaders[$sym] = true;
+            $leaderBtns[] = InlineKeyboardButton::make("📊 {$sym}", callback_data: "chart:{$sym}");
+        }
+        foreach (array_chunk($leaderBtns, 4) as $chunk) {
+            $keyboard->addRow(...$chunk);
+        }
+
+        // 2. Tombol Bandingkan semua sektor (grid 4x2)
+        $bandingBtns = [];
+        foreach ($sectors as $sec) {
+            $members = array_column($sec['members'] ?? [], 'symbol');
+            if (count($members) < 2) {
+                continue;
+            }
+            $tickersStr = implode(' ', array_slice($members, 0, 4));
+            $bandingBtns[] = InlineKeyboardButton::make("⚖️ {$sec['sector']}", callback_data: "banding_list:{$tickersStr}");
+        }
+        foreach (array_chunk($bandingBtns, 2) as $chunk) {
+            $keyboard->addRow(...$chunk);
         }
 
         $bot->sendMessage($msg, parse_mode: ParseMode::HTML, reply_markup: $keyboard);
@@ -1632,13 +1810,17 @@ $runRadar = function (Nutgram $bot) {
             $msg .= "   • {$it['tag']}\n";
             $msg .= "   • Intraday Vol: <b>{$it['vol_ratio']}x</b> | CLV: <b>{$it['clv']}%</b> | 15m: {$cSign}{$it['candle_chg']}%\n\n";
 
-            if ($idx < 3) {
-                $chartBtns[] = InlineKeyboardButton::make("📊 Chart {$it['symbol']}", callback_data: "chart:{$it['symbol']}");
+            if ($idx < 10) {
+                $chartBtns[] = InlineKeyboardButton::make("📊 {$it['symbol']}", callback_data: "chart:{$it['symbol']}");
             }
         }
 
         if (!empty($chartBtns)) {
-            $keyboard->addRow(...$chartBtns);
+            $totalBtns = count($chartBtns);
+            $perRow = $totalBtns <= 5 ? $totalBtns : ($totalBtns === 6 ? 3 : ($totalBtns <= 8 ? 4 : 5));
+            foreach (array_chunk($chartBtns, $perRow) as $chunk) {
+                $keyboard->addRow(...$chunk);
+            }
         }
         $keyboard->addRow(InlineKeyboardButton::make("🔄 Refresh Radar", callback_data: "quick:radar"));
 
@@ -1795,8 +1977,14 @@ $bot->onCommand('settoken {token}', function (Nutgram $bot, string $token) {
 // Helper render hasil Top Retail Jualan + Inline Keyboard Kalender
 $renderTopRetail = function (Nutgram $bot, ?string $fromDate = null, ?string $toDate = null, bool $editMessage = false) {
     $tz = 'Asia/Jakarta';
-    $today = now()->timezone($tz)->format('Y-m-d');
-    $from = $fromDate ?: $today;
+    $now = now()->timezone($tz);
+    $latestBursa = $now->copy();
+    while ($latestBursa->isWeekend()) {
+        $latestBursa->subDay();
+    }
+    $lastBursaStr = $latestBursa->format('Y-m-d');
+    $isAutoDefault = ($fromDate === null && $toDate === null);
+    $from = $fromDate ?: $lastBursaStr;
     $to   = $toDate ?: $from;
 
     if ($from > $to) {
@@ -1817,18 +2005,35 @@ $renderTopRetail = function (Nutgram $bot, ?string $fromDate = null, ?string $to
 
     $result = $screener->scanTopRetailSell($universe, 18, $from, $to);
 
+    // Auto-fallback maksimal 3 hari bursa ke belakang jika default kosong (libur nasional / sebelum data tersedia)
+    if ($isAutoDefault && !isset($result['error']) && empty($result)) {
+        $cursor = \Carbon\Carbon::parse($from, $tz);
+        for ($i = 0; $i < 3; $i++) {
+            $cursor = $cursor->subWeekday();
+            $candidate = $cursor->format('Y-m-d');
+            $tryResult = $screener->scanTopRetailSell($universe, 18, $candidate, $candidate);
+            if (isset($tryResult['error']) || !empty($tryResult)) {
+                $from = $candidate;
+                $to = $candidate;
+                $result = $tryResult;
+                break;
+            }
+        }
+    }
+
     $prevDay = \Carbon\Carbon::parse($from, $tz)->subWeekday()->format('Y-m-d');
     $nextDay = \Carbon\Carbon::parse($to, $tz)->addWeekday()->format('Y-m-d');
-    $yesterday = now()->timezone($tz)->subWeekday()->format('Y-m-d');
-    $d3From = now()->timezone($tz)->subWeekdays(2)->format('Y-m-d');
-    $w1From = now()->timezone($tz)->subWeekdays(4)->format('Y-m-d');
+    $yesterday = $latestBursa->copy()->subWeekday()->format('Y-m-d');
+    $d3From = $latestBursa->copy()->subWeekdays(2)->format('Y-m-d');
+    $w1From = $latestBursa->copy()->subWeekdays(4)->format('Y-m-d');
+    $latestLabel = $now->isWeekend() ? 'Terakhir' : 'Hari Ini';
 
     $keyboard = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup::make()
         ->addRow(
-            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('Hari Ini', callback_data: "ritel:range:{$today}:{$today}"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make($latestLabel, callback_data: "ritel:range:{$lastBursaStr}:{$lastBursaStr}"),
             \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('Kemarin', callback_data: "ritel:range:{$yesterday}:{$yesterday}"),
-            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('3 Hari', callback_data: "ritel:range:{$d3From}:{$today}"),
-            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('1 Minggu', callback_data: "ritel:range:{$w1From}:{$today}")
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('3 Hari', callback_data: "ritel:range:{$d3From}:{$lastBursaStr}"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('1 Minggu', callback_data: "ritel:range:{$w1From}:{$lastBursaStr}")
         )
         ->addRow(
             \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make("⬅️ {$prevDay}", callback_data: "ritel:range:{$prevDay}:{$prevDay}"),
@@ -1885,7 +2090,7 @@ $renderTopRetail = function (Nutgram $bot, ?string $fromDate = null, ?string $to
 
     $text = implode("\n", $lines);
 
-    $topPickChunks = array_chunk(array_slice($result, 0, 6), 3);
+    $topPickChunks = array_chunk(array_slice($result, 0, 10), 5);
     foreach ($topPickChunks as $chunk) {
         $rowBtns = [];
         foreach ($chunk as $item) {
@@ -2009,28 +2214,36 @@ $bot->onCommand('Sesi1', function (\SergiX44\Nutgram\Nutgram $bot) {
 
 // Helper daftar perintah lengkap (/help & tombol Daftar Perintah)
 $sendFullHelp = function (\SergiX44\Nutgram\Nutgram $bot) {
-    $helpText = "📋 <b>DAFTAR LENGKAP PERINTAH BOT</b>\n"
+    $maxRisk = \App\Models\UserRiskProfile::maxRiskFor($bot->chatId());
+    $riskLabel = \App\Models\UserRiskProfile::formatShort($maxRisk);
+
+    $helpText = "📋 <b>DAFTAR LENGKAP PERINTAH EASY CUAN</b>\n"
               . "━━━━━━━━━━━━━━━━━━━━\n"
-              . "🌅 <b>Market & Sektor:</b>\n"
-              . "• <code>/brief</code> — Morning Market Brief & Macro Radar\n"
+              . "🌍 <b>Market &amp; Sektor:</b>\n"
+              . "• <code>/brief</code> — Morning Brief &amp; IHSG Macro\n"
               . "• <code>/sesi1</code> — Market Report Sesi 1 (Gainer, Asing, Rebound, Vol)\n"
-              . "• <code>/sektor</code> — Peta Rotasi & Kinerja Indeks Sektoral\n"
-              . "• <code>/radar</code> — Radar Saham Potensial & Momentum\n\n"
-              . "📈 <b>Teknikal & Proyeksi AI:</b>\n"
-              . "• <code>/analisa KODE</code> — Chart teknikal, sinyal & lot sizing\n"
+              . "• <code>/sektor</code> — Rotasi &amp; Momentum 8 Sektor BEI\n"
+              . "• <code>/radar</code> — Intraday Sweep &amp; Unusual Vol (15m)\n\n"
+              . "📊 <b>Teknikal, Trading Plan &amp; AI:</b>\n"
+              . "• <code>/analisa KODE</code> — Chart &amp; Plan (Risk <b>{$riskLabel}</b>)\n"
+              . "• <code>/analisa KODE 500000</code> — Plan Custom Max Risk\n"
+              . "• <code>/setrisk</code> — Atur Modal &amp; Risk (Aktif: <b>{$riskLabel}</b>)\n"
               . "• <code>/mtf KODE</code> — Multi-Timeframe Confluence (1H/1D/1W)\n"
               . "• <code>/forecast KODE</code> (atau <code>/ai KODE</code>) — Proyeksi 5D Kronos AI\n\n"
-              . "💎 <b>Fundamental & Valuasi:</b>\n"
-              . "• <code>/valuasi KODE</code> — Fair Value (Graham, EPV, DCF) & MoS\n"
-              . "• <code>/audit KODE</code> — Piotroski F-Score Quality Audit\n"
-              . "• <code>/banding KODE1 KODE2</code> — Komparasi peer satu sektor\n\n"
-              . "🔍 <b>Screener & Broker Flow:</b>\n"
-              . "• <code>/screener</code> — Screener sinyal teknikal & fundamental\n"
-              . "• <code>/dividen</code> — Screener saham dividen yield tinggi\n"
-              . "• <code>/volume</code> — Deteksi lonjakan volume tidak wajar\n"
-              . "• <code>/akumulasi</code> — Deteksi saham akumulasi bandar\n"
-              . "• <code>/topritel</code> — Screener Top Retail Jualan (Stockbit)\n\n"
-              . "🔔 <b>Watchlist & Pengaturan:</b>\n"
+              . "🏦 <b>Bandarmologi &amp; Flow:</b>\n"
+              . "• <code>/brokersum KODE</code> — Broker Summary Real-Time\n"
+              . "• <code>/topritel</code> — Top Retail Jualan (Stockbit)\n"
+              . "• <code>/akumulasi</code> — Deteksi Akumulasi (VSA/OBV)\n"
+              . "• <code>/volume</code> — Lonjakan Volume &gt;= 1.5x\n\n"
+              . "🔍 <b>Screener Fundamental:</b>\n"
+              . "• <code>/screener</code> — Default (PER &lt; 10, PBV &lt; 5)\n"
+              . "• <code>/screener 10 2 1</code> — Custom PER, PBV, [DER]\n"
+              . "• <code>/dividen 10</code> — Dividend Yield &gt;= 10%\n\n"
+              . "💎 <b>Valuasi, Komparasi &amp; Audit:</b>\n"
+              . "• <code>/valuasi KODE</code> — Fair Value (Graham, EPV, DCF) &amp; MoS\n"
+              . "• <code>/banding KODE1 KODE2</code> — Komparasi Head-to-Head\n"
+              . "• <code>/audit KODE</code> — Kualitas Laba &amp; Piotroski F-Score\n\n"
+              . "🔔 <b>Watchlist &amp; Pengaturan:</b>\n"
               . "• <code>/watchlist</code> — Lihat daftar saham yang dipantau\n"
               . "• <code>/pantau KODE</code> — Tambah saham ke alert otomatis\n"
               . "• <code>/unpantau KODE</code> — Hapus saham dari watchlist\n"

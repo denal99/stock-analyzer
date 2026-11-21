@@ -1397,7 +1397,19 @@ class StockScreenerService
 
     public function getStockbitToken(): ?string
     {
-        return Cache::get('stockbit_bearer_token') ?: env('STOCKBIT_BEARER_TOKEN');
+        $token = Cache::get('stockbit_bearer_token');
+        if (empty($token)) {
+            $path = storage_path('app/stockbit_token.json');
+            if (file_exists($path)) {
+                $saved = json_decode(file_get_contents($path), true);
+                if (!empty($saved['token']) && !empty($saved['expires_at']) && time() < (int) $saved['expires_at']) {
+                    $token = $saved['token'];
+                    Cache::put('stockbit_bearer_token', $token, \Carbon\Carbon::createFromTimestamp((int) $saved['expires_at']));
+                }
+            }
+        }
+
+        return $token ?: env('STOCKBIT_BEARER_TOKEN');
     }
 
     public function scanTopRetailSell(array $tickers, int $limit = 18, ?string $fromDate = null, ?string $toDate = null): array
@@ -1725,7 +1737,7 @@ class StockScreenerService
             $effectiveTo   = $effectiveFrom;
         }
 
-        $cacheKey = "sb_brokersum_range_{$sym}_{$effectiveFrom}_{$effectiveTo}";
+        $cacheKey = "sb_brokersum_range_v2_{$sym}_{$effectiveFrom}_{$effectiveTo}";
         return \Illuminate\Support\Facades\Cache::remember($cacheKey, 180, function () use ($sym, $token, $effectiveFrom, $effectiveTo) {
             try {
                 $resp = \Illuminate\Support\Facades\Http::withToken($token)
@@ -1794,12 +1806,23 @@ class StockScreenerService
                     'symbol'       => $sym,
                     'from'         => $effectiveFrom,
                     'to'           => $effectiveTo,
-                    'status'       => $bandar['accdist'] ?? 'Netral',
+                    'status'       => $bandar['avg']['accdist'] ?? $bandar['broker_accdist'] ?? 'Netral',
                     'buyer_count'  => (int) ($bandar['total_buyer'] ?? count($rawBuy)),
                     'seller_count' => (int) ($bandar['total_seller'] ?? count($rawSell)),
                     'net_top5'     => $netBuySum - $netSellSum,
                     'top_buy'      => $topBuy,
                     'top_sell'     => $topSell,
+                    'bandar'       => [
+                        'top1'           => $bandar['top1'] ?? null,
+                        'top3'           => $bandar['top3'] ?? null,
+                        'top5'           => $bandar['top5'] ?? null,
+                        'avg'            => $bandar['avg'] ?? null,
+                        'broker_accdist' => $bandar['broker_accdist'] ?? 'Neutral',
+                        'broker_diff'    => (int) ($bandar['number_broker_buysell'] ?? 0),
+                        'net_vol'        => (float) ($bandar['volume'] ?? 0),
+                        'net_val'        => (float) ($bandar['value'] ?? 0),
+                        'avg_price'      => (float) ($bandar['average'] ?? 0),
+                    ],
                 ];
             } catch (\Throwable $e) {
                 return ['error' => 'EXCEPTION', 'status' => $e->getMessage()];

@@ -9,7 +9,7 @@ use Exception;
 
 class StockAnalysisService
 {
-    public function analyze(string $ticker, float $maxRiskRp = 1000000, string $timeframe = '1D'): array
+    public function analyze(string $ticker, float $maxRiskRp = 1000000, string $timeframe = '1D', ?float $maxCapitalRp = null): array
     {
         $symbol = strtoupper(trim($ticker));
         if (strlen($symbol) === 4 && ctype_alpha($symbol)) {
@@ -194,11 +194,22 @@ class StockAnalysisService
             $stoploss = $isIdx ? $this->stepIdxTick($lastClose, -3) : round($lastClose * 0.97, 2);
         }
 
-        // Money Management berdasarkan Max Risk yang ditentukan
+        // Money Management berdasarkan Max Risk yang ditentukan (+ opsional Capital Cap)
         $riskPerShare = max(1, $lastClose - $stoploss);
         $recShares = floor($maxRiskRp / $riskPerShare);
-        $recLot = max(1, floor($recShares / 100));
+        $recLot = max(1, (int) floor($recShares / 100));
+        $capitalCapped = false;
+
+        if ($maxCapitalRp !== null && $maxCapitalRp > 0 && $lastClose > 0) {
+            $maxLotByCapital = (int) floor($maxCapitalRp / (100 * $lastClose));
+            if ($recLot > $maxLotByCapital) {
+                $recLot = max(0, $maxLotByCapital);
+                $capitalCapped = true;
+            }
+        }
+
         $allocRp = $recLot * 100 * $lastClose;
+        $effectiveRiskRp = $recLot * 100 * $riskPerShare;
 
         // Status Sinyal
         $signalStatus = "Sideways / Konsolidasi";
@@ -241,6 +252,8 @@ class StockAnalysisService
             'max_risk_rp' => $maxRiskRp,
             'rec_lot' => $recLot,
             'alloc_rp' => $allocRp,
+            'effective_risk_rp' => $effectiveRiskRp,
+            'capital_capped' => $capitalCapped,
             'signal' => $signalStatus,
             'vol_lot' => $todayVolLot,
             'ma_vol_lot' => $maVol20Lot,
@@ -276,6 +289,8 @@ class StockAnalysisService
             'max_risk_rp' => $metaInfo['max_risk_rp'] ?? 0,
             'rec_lot' => $metaInfo['rec_lot'] ?? 0,
             'alloc_rp' => $metaInfo['alloc_rp'] ?? 0,
+            'effective_risk_rp' => $metaInfo['effective_risk_rp'] ?? 0,
+            'capital_capped' => $metaInfo['capital_capped'] ?? false,
             'signal' => $metaInfo['signal'] ?? '',
             'vol_ratio' => $metaInfo['vol_ratio'] ?? 0,
             'data_source' => $dataSource,
@@ -719,7 +734,8 @@ class StockAnalysisService
         $this->drawText($canvas, 9, 14, 50, $black, $line3, false);
 
         // Baris 4: Money Management (Dynamic Max Risk)
-        $line4 = "MM: Max Risk Rp " . number_format($meta['max_risk_rp']) . "  |  Alokasi Dana: Rp " . number_format($meta['alloc_rp']) . "  =>  Rec: " . number_format($meta['rec_lot']) . " Lot";
+        $capTag = !empty($meta['capital_capped']) ? " [Cap Modal]" : "";
+        $line4 = "MM: Max Risk Rp " . number_format($meta['max_risk_rp']) . "  |  Alokasi Dana: Rp " . number_format($meta['alloc_rp']) . "  =>  Rec: " . number_format($meta['rec_lot']) . " Lot" . $capTag;
         $this->drawText($canvas, 9, 14, 70, $blue, $line4, true);
 
         // Sidebar Kiri: RESISTANCE & SUPPORT
