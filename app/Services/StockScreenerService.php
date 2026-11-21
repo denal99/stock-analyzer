@@ -129,7 +129,7 @@ class StockScreenerService
             throw new Exception('Masukkan minimal 2 kode saham untuk dibandingkan (contoh: /banding BBRI BMRI BBCA BBNI).');
         }
 
-        $cacheKey = 'idx_compare_v2_' . implode('_', $symbols);
+        $cacheKey = 'idx_compare_v3_' . implode('_', $symbols);
 
         return Cache::remember($cacheKey, 600, function () use ($symbols) {
             $auth = $this->getYahooCrumbAndCookie();
@@ -228,46 +228,113 @@ class StockScreenerService
                 ];
             }
 
-            // Relative Peer Scoring (Max 100 poin: PER 20, PBV 15, ROE 25, NPM 15, Growth 15, Dividen 10)
-            $pers = array_filter(array_column($results, 'per'), fn($v) => $v !== null && $v > 0);
-            $minPer = !empty($pers) ? min($pers) : null;
+            // Pillar Scoring + Anti-Value Trap & Dividend Trap Guard (Max 100 poin)
+            $scoreROE = function (?float $val, float $max): float {
+                if ($val === null || $val <= 0) return 0;
+                if ($val >= 20) return $max;
+                if ($val >= 15) return $max * 0.85;
+                if ($val >= 10) return $max * 0.65;
+                return $max * 0.35;
+            };
 
-            $pbvs = array_filter(array_column($results, 'pbv'), fn($v) => $v !== null && $v > 0);
-            $minPbv = !empty($pbvs) ? min($pbvs) : null;
+            $scoreNPM = function (?float $val, float $max): float {
+                if ($val === null || $val <= 0) return 0;
+                if ($val >= 15) return $max;
+                if ($val >= 10) return $max * 0.80;
+                if ($val >= 5)  return $max * 0.50;
+                return $max * 0.25;
+            };
 
-            $roes = array_filter(array_column($results, 'roe'), fn($v) => $v !== null && $v > 0);
-            $maxRoe = !empty($roes) ? max($roes) : null;
+            $scoreYoY = function (?float $val, float $max): float {
+                if ($val === null || $val <= -30) return 0;
+                if ($val >= 25) return $max;
+                if ($val >= 10) return $max * 0.80;
+                if ($val >= 0)  return $max * 0.55;
+                if ($val > -15) return $max * 0.30;
+                return $max * 0.10;
+            };
 
-            $npms = array_filter(array_column($results, 'npm'), fn($v) => $v !== null && $v > 0);
-            $maxNpm = !empty($npms) ? max($npms) : null;
+            $scoreDER = function (?float $val, float $max): float {
+                if ($val === null || $val < 0) return $max * 0.50;
+                if ($val <= 0.5) return $max;
+                if ($val <= 1.0) return $max * 0.80;
+                if ($val <= 1.5) return $max * 0.50;
+                if ($val <= 2.0) return $max * 0.25;
+                return 0;
+            };
 
-            $earns = array_filter(array_column($results, 'earn_growth'), fn($v) => $v !== null && $v > 0);
-            $maxEarn = !empty($earns) ? max($earns) : null;
+            $scorePER = function (?float $val, float $max): float {
+                if ($val === null || $val <= 0) return 0;
+                if ($val <= 8)  return $max;
+                if ($val <= 12) return $max * 0.80;
+                if ($val <= 16) return $max * 0.60;
+                if ($val <= 22) return $max * 0.35;
+                return $max * 0.15;
+            };
 
-            $divs = array_filter(array_column($results, 'dividend_yield'), fn($v) => $v !== null && $v > 0);
-            $maxDiv = !empty($divs) ? max($divs) : null;
+            $scorePBV = function (?float $val, float $max): float {
+                if ($val === null || $val <= 0) return 0;
+                if ($val <= 1.0) return $max;
+                if ($val <= 1.5) return $max * 0.80;
+                if ($val <= 2.5) return $max * 0.50;
+                return $max * 0.20;
+            };
+
+            $scoreDividend = function (?float $val, float $max): float {
+                if ($val === null || $val <= 0) return 0;
+                if ($val >= 8) return $max;
+                if ($val >= 5) return $max * 0.80;
+                if ($val >= 3) return $max * 0.55;
+                return $max * 0.30;
+            };
+
+            $bankTickers = ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'BRIS', 'BNGA', 'BDMN', 'BNII', 'NISP', 'BBTN', 'BJBR', 'BJTM', 'BTPS', 'ARTO', 'BBYB', 'AGRO', 'MEGA', 'PNBN', 'BTPN'];
 
             foreach ($results as &$item) {
-                $score = 0;
-                if ($minPer && $item['per'] !== null && $item['per'] > 0) {
-                    $score += ($minPer / $item['per']) * 20;
+                $roe      = $item['roe'];
+                $npm      = $item['npm'];
+                $labaYoY  = $item['earn_growth'];
+                $der      = $item['der'];
+                $per      = $item['per'];
+                $pbv      = $item['pbv'];
+                $divYield = $item['dividend_yield'];
+                $isBank   = in_array($item['symbol'], $bankTickers, true);
+
+                // 1. Hitung skor dasar per pilar
+                $scoreProfit = $scoreROE($roe, 15) + $scoreNPM($npm, 15);
+                $scoreGrowth = $scoreYoY($labaYoY, 25);
+                $scoreSolv   = $isBank ? 15 : $scoreDER($der, 20);
+                $scoreVal    = $scorePER($per, 10) + $scorePBV($pbv, 5);
+                $scoreDiv    = $scoreDividend($divYield, 10);
+
+                // 2. Anti-Value Trap & Dividend Trap Guard
+                $isLoss = (($roe !== null && $roe < 0) || ($npm !== null && $npm < 0) || $per === null || $per <= 0);
+
+                if ($isLoss || ($labaYoY !== null && $labaYoY < -40)) {
+                    $scoreVal = 0;
+                    $scoreDiv = $isLoss ? 0 : ($scoreDiv * 0.5);
+                } elseif ($labaYoY !== null && $labaYoY < -25) {
+                    $scoreVal *= 0.5;
                 }
-                if ($minPbv && $item['pbv'] !== null && $item['pbv'] > 0) {
-                    $score += ($minPbv / $item['pbv']) * 15;
+
+                // 3. Penalti Utang (Non-Bank)
+                $penalty = 0;
+                if (!$isBank && $der !== null) {
+                    if ($der > 2.0) {
+                        $penalty = 10;
+                    } elseif ($der > 1.5) {
+                        $penalty = 5;
+                    }
                 }
-                if ($maxRoe && $item['roe'] !== null && $item['roe'] > 0) {
-                    $score += ($item['roe'] / $maxRoe) * 25;
+
+                // 4. Total & Hard Cap
+                $finalScore = (int) round(max(0, ($scoreProfit + $scoreGrowth + $scoreSolv + $scoreVal + $scoreDiv) - $penalty));
+
+                if ($isLoss) {
+                    $finalScore = min($finalScore, 35);
                 }
-                if ($maxNpm && $item['npm'] !== null && $item['npm'] > 0) {
-                    $score += ($item['npm'] / $maxNpm) * 15;
-                }
-                if ($maxEarn && $item['earn_growth'] !== null && $item['earn_growth'] > 0) {
-                    $score += ($item['earn_growth'] / $maxEarn) * 15;
-                }
-                if ($maxDiv && $item['dividend_yield'] !== null && $item['dividend_yield'] > 0) {
-                    $score += ($item['dividend_yield'] / $maxDiv) * 10;
-                }
-                $item['score'] = (int) round($score);
+
+                $item['score'] = $finalScore;
             }
             unset($item);
 
@@ -1631,5 +1698,112 @@ class StockScreenerService
             'min_prob'      => $minProb,
             'results'       => $matches,
         ];
+    }
+
+    public function getBrokerSummary(string $rawSymbol, string $fromDate, string $toDate): array
+    {
+        $sym = preg_replace('/JK$/', '', strtoupper(trim(preg_replace('/[^A-Za-z0-9]/', '', $rawSymbol))));
+        if (strlen($sym) < 4) {
+            return ['error' => 'INVALID_SYMBOL'];
+        }
+
+        $token = $this->getStockbitToken();
+        if (empty($token)) {
+            return ['error' => 'NO_TOKEN'];
+        }
+
+        $effectiveFrom = $fromDate;
+        $effectiveTo   = $toDate;
+
+        // Jika single-day (1D) jatuh di akhir pekan, mundur otomatis ke Jumat bursa terakhir
+        if ($fromDate === $toDate) {
+            $dt = \Carbon\Carbon::parse($fromDate, 'Asia/Jakarta');
+            while ($dt->isWeekend()) {
+                $dt->subDay();
+            }
+            $effectiveFrom = $dt->format('Y-m-d');
+            $effectiveTo   = $effectiveFrom;
+        }
+
+        $cacheKey = "sb_brokersum_range_{$sym}_{$effectiveFrom}_{$effectiveTo}";
+        return \Illuminate\Support\Facades\Cache::remember($cacheKey, 180, function () use ($sym, $token, $effectiveFrom, $effectiveTo) {
+            try {
+                $resp = \Illuminate\Support\Facades\Http::withToken($token)
+                    ->withOptions(['force_ip_resolve' => 'v4'])
+                    ->withHeaders([
+                        'Origin'     => 'https://stockbit.com',
+                        'Referer'    => 'https://stockbit.com/',
+                        'User-Agent' => 'Mozilla/5.0',
+                    ])
+                    ->connectTimeout(5)
+                    ->timeout(8)
+                    ->get("https://exodus.stockbit.com/marketdetectors/{$sym}", [
+                        'from'             => $effectiveFrom,
+                        'to'               => $effectiveTo,
+                        'transaction_type' => 'TRANSACTION_TYPE_NET',
+                        'market_board'     => 'MARKET_BOARD_REGULER',
+                        'investor_type'    => 'INVESTOR_TYPE_ALL',
+                    ]);
+
+                if (!$resp->successful()) {
+                    if (in_array($resp->status(), [401, 403])) {
+                        return ['error' => 'TOKEN_EXPIRED'];
+                    }
+                    return ['error' => 'HTTP_ERROR', 'status' => $resp->status()];
+                }
+
+                $json = $resp->json();
+                $data = $json['data'] ?? [];
+                $bs   = $data['broker_summary'] ?? [];
+                $bandar = $data['bandar_detector'] ?? [];
+
+                $rawBuy  = $bs['brokers_buy'] ?? [];
+                $rawSell = $bs['brokers_sell'] ?? [];
+
+                $topBuy = [];
+                $netBuySum = 0.0;
+                foreach (array_slice($rawBuy, 0, 5) as $idx => $b) {
+                    $val = (float) ($b['bval'] ?? $b['netbs_buy_val'] ?? 0);
+                    $lot = (float) ($b['blot'] ?? $b['netbs_buy_lot'] ?? 0);
+                    $avg = (float) ($b['netbs_buy_avg_price'] ?? ($lot > 0 ? $val / ($lot * 100) : 0));
+                    $netBuySum += $val;
+                    $topBuy[] = [
+                        'code' => $b['netbs_broker_code'] ?? '-',
+                        'val'  => $val,
+                        'lot'  => $lot,
+                        'avg'  => $avg,
+                    ];
+                }
+
+                $topSell = [];
+                $netSellSum = 0.0;
+                foreach (array_slice($rawSell, 0, 5) as $idx => $s) {
+                    $val = abs((float) ($s['sval'] ?? $s['netbs_sell_val'] ?? 0));
+                    $lot = abs((float) ($s['slot'] ?? $s['netbs_sell_lot'] ?? 0));
+                    $avg = (float) ($s['netbs_sell_avg_price'] ?? ($lot > 0 ? $val / ($lot * 100) : 0));
+                    $netSellSum += $val;
+                    $topSell[] = [
+                        'code' => $s['netbs_broker_code'] ?? '-',
+                        'val'  => $val,
+                        'lot'  => $lot,
+                        'avg'  => $avg,
+                    ];
+                }
+
+                return [
+                    'symbol'       => $sym,
+                    'from'         => $effectiveFrom,
+                    'to'           => $effectiveTo,
+                    'status'       => $bandar['accdist'] ?? 'Netral',
+                    'buyer_count'  => (int) ($bandar['total_buyer'] ?? count($rawBuy)),
+                    'seller_count' => (int) ($bandar['total_seller'] ?? count($rawSell)),
+                    'net_top5'     => $netBuySum - $netSellSum,
+                    'top_buy'      => $topBuy,
+                    'top_sell'     => $topSell,
+                ];
+            } catch (\Throwable $e) {
+                return ['error' => 'EXCEPTION', 'status' => $e->getMessage()];
+            }
+        });
     }
 }

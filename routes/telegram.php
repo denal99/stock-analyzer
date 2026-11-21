@@ -299,6 +299,330 @@ $bot->onCommand('start', function (Nutgram $bot) {
     $bot->sendMessage($msg, parse_mode: ParseMode::HTML);
 });
 
+// =========================================================================
+// BROKER SUMMARY DENGAN INTERACTIVE INLINE CALENDAR DATE-RANGE PICKER
+// =========================================================================
+$fmtIdrShort = function (float $val): string {
+    $abs = abs($val);
+    $sign = $val < 0 ? '-' : '';
+    if ($abs >= 1e12) return $sign . number_format($abs / 1e12, 2) . ' T';
+    if ($abs >= 1e9)  return $sign . number_format($abs / 1e9, 2) . ' M';
+    if ($abs >= 1e6)  return $sign . number_format($abs / 1e6, 1) . ' Jt';
+    return $sign . number_format($abs, 0);
+};
+
+$buildBrokerCalendar = function (string $sym, int $year, int $month, ?string $startDate = null) {
+    $dt = \Carbon\Carbon::createFromDate($year, $month, 1, 'Asia/Jakarta');
+    $todayStr = now('Asia/Jakarta')->format('Y-m-d');
+
+    $prev = $dt->copy()->subMonth();
+    $next = $dt->copy()->addMonth();
+
+    $monthNames = [
+        1 => 'Januari', 2 => 'Februari', 3 => 'Maret', 4 => 'April',
+        5 => 'Mei', 6 => 'Juni', 7 => 'Juli', 8 => 'Agustus',
+        9 => 'September', 10 => 'Oktober', 11 => 'November', 12 => 'Desember'
+    ];
+    $monthLabel = ($monthNames[$month] ?? $dt->format('M')) . ' ' . $year;
+
+    $kb = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup::make();
+
+    // Baris navigasi bulan
+    $kb->addRow(
+        \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('◀️', callback_data: "bscal:nav:{$sym}:{$prev->year}:{$prev->month}"),
+        \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make("📅 {$monthLabel}", callback_data: "bscal:noop"),
+        \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('▶️', callback_data: "bscal:nav:{$sym}:{$next->year}:{$next->month}")
+    );
+
+    // Header hari (Senin - Minggu)
+    $dayHeaders = [];
+    foreach (['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'] as $dh) {
+        $dayHeaders[] = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make($dh, callback_data: "bscal:noop");
+    }
+    $kb->addRow(...$dayHeaders);
+
+    // Grid tanggal
+    $firstWeekday = $dt->dayOfWeekIso;
+    $daysInMonth  = $dt->daysInMonth;
+    $row = [];
+
+    for ($i = 1; $i < $firstWeekday; $i++) {
+        $row[] = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make(' ', callback_data: "bscal:noop");
+    }
+
+    for ($d = 1; $d <= $daysInMonth; $d++) {
+        $dateStr = sprintf('%04d-%02d-%02d', $year, $month, $d);
+        $isFuture = $dateStr > $todayStr;
+
+        if ($isFuture) {
+            $label = '·';
+            $cb = 'bscal:noop';
+        } else {
+            $label = ($startDate === $dateStr) ? "[{$d}]" : (string) $d;
+            $cb = "bscal:pick:{$sym}:{$dateStr}";
+        }
+
+        $row[] = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make($label, callback_data: $cb);
+
+        if (count($row) === 7) {
+            $kb->addRow(...$row);
+            $row = [];
+        }
+    }
+
+    if (!empty($row)) {
+        while (count($row) < 7) {
+            $row[] = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make(' ', callback_data: "bscal:noop");
+        }
+        $kb->addRow(...$row);
+    }
+
+    // Baris tombol aksi cepat & reset
+    $kb->addRow(
+        \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('⚡ Hari Ini', callback_data: "bsrun:{$sym}:1D"),
+        \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('🔄 Reset', callback_data: "bscal:reset:{$sym}:{$year}:{$month}"),
+        \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('🔙 Menu', callback_data: "bsmenu:{$sym}")
+    );
+
+    return $kb;
+};
+
+$renderBrokerSummary = function (\SergiX44\Nutgram\Nutgram $bot, string $sym, string $fromDate, string $toDate, bool $editMessage = false) use ($fmtIdrShort) {
+    $screener = app(\App\Services\StockScreenerService::class);
+    $res = $screener->getBrokerSummary($sym, $fromDate, $toDate);
+
+    $kb = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup::make()
+        ->addRow(
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('1D', callback_data: "bsrun:{$sym}:1D"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('1W', callback_data: "bsrun:{$sym}:1W"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('1M', callback_data: "bsrun:{$sym}:1M"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('📅 Kalender', callback_data: "bscal:open:{$sym}")
+        )
+        ->addRow(
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make("📊 Chart {$sym}", callback_data: "chart:{$sym}")
+        );
+
+    if (isset($res['error'])) {
+        $errMap = [
+            'NO_TOKEN'      => '⚠️ Token Stockbit belum diatur. Gunakan perintah <code>/settoken TOKEN_ANDA</code>.',
+            'TOKEN_EXPIRED' => '🔴 Token Stockbit sudah expired. Silakan perbarui via <code>/settoken TOKEN_BARU</code>.',
+            'INVALID_SYMBOL'=> '❌ Kode saham tidak valid.',
+        ];
+        $errMsg = $errMap[$res['error']] ?? "❌ Gagal memuat Broker Summary {$sym} (HTTP " . ($res['status'] ?? '-') . ").";
+        if ($editMessage) {
+            $bot->editMessageText($errMsg, parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML, reply_markup: $kb);
+        } else {
+            $bot->sendMessage($errMsg, parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML, reply_markup: $kb);
+        }
+        return;
+    }
+
+    $fromFmt = \Carbon\Carbon::parse($res['from'])->format('d M Y');
+    $toFmt   = \Carbon\Carbon::parse($res['to'])->format('d M Y');
+    $periodStr = ($res['from'] === $res['to']) ? $fromFmt : "{$fromFmt} – {$toFmt}";
+
+    $statusRaw = (string) ($res['status'] ?? 'Netral');
+    $statusEmoji = str_contains(strtolower($statusRaw), 'acc') ? '🟢' : (str_contains(strtolower($statusRaw), 'dist') ? '🔴' : '🟡');
+
+    $msg  = "🕵️ <b>BROKER SUMMARY: {$res['symbol']}</b>\n";
+    $nowWib = now('Asia/Jakarta')->format('d/m/Y H:i');
+    $msg .= "📅 <b>Periode:</b> {$periodStr}\n";
+    $msg .= "📡 <b>Sumber:</b> 🟢 Stockbit Real-Time ({$nowWib} WIB)\n";
+    $msg .= "━━━━━━━━━━━━━━━━━━━━\n";
+    $msg .= "{$statusEmoji} <b>Status Bandar:</b> {$statusRaw}\n";
+    $msg .= "📊 <b>Partisipan:</b> {$res['buyer_count']} Buyer vs {$res['seller_count']} Seller\n";
+    $msg .= "💰 <b>Net Top 5:</b> <b>" . $fmtIdrShort((float) $res['net_top5']) . "</b>\n\n";
+
+    $msg .= "🟢 <b>TOP 5 NET BUYER</b>\n";
+    if (empty($res['top_buy'])) {
+        $msg .= "   <i>Tidak ada data transaksi pada periode ini (libur/akhir pekan).</i>\n";
+    } else {
+        foreach ($res['top_buy'] as $idx => $b) {
+            $no  = $idx + 1;
+            $val = $fmtIdrShort((float) $b['val']);
+            $avg = number_format((float) $b['avg'], 0);
+            $lot = number_format((float) $b['lot'], 0);
+            $msg .= "   {$no}. <b>{$b['code']}</b>: {$val} ({$lot} lot @ Rp {$avg})\n";
+        }
+    }
+
+    $msg .= "\n🔴 <b>TOP 5 NET SELLER</b>\n";
+    if (empty($res['top_sell'])) {
+        $msg .= "   <i>Tidak ada data transaksi pada periode ini.</i>\n";
+    } else {
+        foreach ($res['top_sell'] as $idx => $s) {
+            $no  = $idx + 1;
+            $val = $fmtIdrShort((float) $s['val']);
+            $avg = number_format((float) $s['avg'], 0);
+            $lot = number_format((float) $s['lot'], 0);
+            $msg .= "   {$no}. <b>{$s['code']}</b>: {$val} ({$lot} lot @ Rp {$avg})\n";
+        }
+    }
+
+    $msg .= "\n<i>💡 Klik 📅 Kalender untuk memilih rentang tanggal custom.</i>";
+
+    if ($editMessage) {
+        $bot->editMessageText($msg, parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML, reply_markup: $kb);
+    } else {
+        $bot->sendMessage($msg, parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML, reply_markup: $kb);
+    }
+};
+
+$sendBrokerMenu = function (\SergiX44\Nutgram\Nutgram $bot, string $rawSym, bool $editMessage = false) {
+    $sym = preg_replace('/JK$/', '', strtoupper(trim(preg_replace('/[^A-Za-z0-9]/', '', $rawSym))));
+    if (strlen($sym) < 4) {
+        $bot->sendMessage('❌ Kode saham tidak valid. Contoh: <code>/brokersum BBRI</code>', parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML);
+        return;
+    }
+
+    $text = "🕵️ <b>MENU BROKER SUMMARY: {$sym}</b>\n"
+          . "━━━━━━━━━━━━━━━━━━━━\n"
+          . "Pilih periode cepat di bawah ini atau klik <b>📅 Pilih Tanggal (Kalender)</b> untuk menentukan rentang tanggal mulai dan akhir secara manual:";
+
+    $kb = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup::make()
+        ->addRow(
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('⚡ Hari Ini (1D)', callback_data: "bsrun:{$sym}:1D"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('📆 7 Hari (1W)', callback_data: "bsrun:{$sym}:1W"),
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('🗓 30 Hari (1M)', callback_data: "bsrun:{$sym}:1M")
+        )
+        ->addRow(
+            \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make('📅 Pilih Tanggal (Kalender)', callback_data: "bscal:open:{$sym}")
+        );
+
+    if ($editMessage) {
+        $bot->editMessageText($text, parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML, reply_markup: $kb);
+    } else {
+        $bot->sendMessage($text, parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML, reply_markup: $kb);
+    }
+};
+
+// Command /brokersum, /broker, /bandar
+$bot->onCommand("brokersum {symbol}", function (\SergiX44\Nutgram\Nutgram $bot, string $symbol) use ($sendBrokerMenu) {
+    $sendBrokerMenu($bot, $symbol, false);
+});
+$bot->onCommand("brokersum", function (\SergiX44\Nutgram\Nutgram $bot) {
+    $bot->sendMessage("🕵️ <b>Format Broker Summary:</b>\nKetik <code>/brokersum KODE</code> (contoh: <code>/brokersum BBRI</code>)", parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML);
+});
+$bot->onCommand("broker {symbol}", function (\SergiX44\Nutgram\Nutgram $bot, string $symbol) use ($sendBrokerMenu) {
+    $sendBrokerMenu($bot, $symbol, false);
+});
+$bot->onCommand("bandar {symbol}", function (\SergiX44\Nutgram\Nutgram $bot, string $symbol) use ($sendBrokerMenu) {
+    $sendBrokerMenu($bot, $symbol, false);
+});
+
+// Callback: Kembali ke menu utama broker summary
+$bot->onCallbackQueryData('bsmenu:{sym}', function (\SergiX44\Nutgram\Nutgram $bot, string $sym) use ($sendBrokerMenu) {
+    $bot->answerCallbackQuery();
+    $sendBrokerMenu($bot, $sym, true);
+});
+
+// Callback: Preset 1D / 1W / 1M
+$bot->onCallbackQueryData('bsrun:{sym}:{preset}', function (\SergiX44\Nutgram\Nutgram $bot, string $sym, string $preset) use ($renderBrokerSummary) {
+    $bot->answerCallbackQuery(text: "⏳ Memuat data {$sym} ({$preset})...");
+    $to = now('Asia/Jakarta')->format('Y-m-d');
+    $from = match ($preset) {
+        '1W' => now('Asia/Jakarta')->subDays(7)->format('Y-m-d'),
+        '1M' => now('Asia/Jakarta')->subDays(30)->format('Y-m-d'),
+        default => $to,
+    };
+    $renderBrokerSummary($bot, $sym, $from, $to, true);
+});
+
+// Callback: Buka kalender bulan berjalan
+$bot->onCallbackQueryData('bscal:open:{sym}', function (\SergiX44\Nutgram\Nutgram $bot, string $sym) use ($buildBrokerCalendar) {
+    $bot->answerCallbackQuery();
+    $userId = $bot->userId() ?? 0;
+    \Illuminate\Support\Facades\Cache::forget("bs_pick_{$userId}_{$sym}");
+
+    $now = now('Asia/Jakarta');
+    $kb = $buildBrokerCalendar($sym, $now->year, $now->month, null);
+    $bot->editMessageText(
+        "📅 <b>PILIH TANGGAL BROKER SUMMARY: {$sym}</b>\n"
+        . "━━━━━━━━━━━━━━━━━━━━\n"
+        . "1️⃣ Klik <b>Tanggal Mulai (From)</b> pada kalender di bawah.\n"
+        . "2️⃣ Lalu klik <b>Tanggal Akhir (To)</b> (klik tanggal yang sama 2x untuk 1 hari).",
+        parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML,
+        reply_markup: $kb
+    );
+});
+
+// Callback: Navigasi bulan kalender (prev/next)
+$bot->onCallbackQueryData('bscal:nav:{sym}:{year}:{month}', function (\SergiX44\Nutgram\Nutgram $bot, string $sym, string $year, string $month) use ($buildBrokerCalendar) {
+    $bot->answerCallbackQuery();
+    $userId = $bot->userId() ?? 0;
+    $startDate = \Illuminate\Support\Facades\Cache::get("bs_pick_{$userId}_{$sym}");
+
+    $kb = $buildBrokerCalendar($sym, (int) $year, (int) $month, $startDate);
+    $statusInfo = $startDate
+        ? "✅ Tanggal Mulai: <b>{$startDate}</b>\n2️⃣ Sekarang pilih <b>Tanggal Akhir (To)</b>:"
+        : "1️⃣ Klik <b>Tanggal Mulai (From)</b> pada kalender di bawah:";
+
+    $bot->editMessageText(
+        "📅 <b>PILIH TANGGAL BROKER SUMMARY: {$sym}</b>\n"
+        . "━━━━━━━━━━━━━━━━━━━━\n"
+        . $statusInfo,
+        parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML,
+        reply_markup: $kb
+    );
+});
+
+// Callback: Reset pilihan tanggal
+$bot->onCallbackQueryData('bscal:reset:{sym}:{year}:{month}', function (\SergiX44\Nutgram\Nutgram $bot, string $sym, string $year, string $month) use ($buildBrokerCalendar) {
+    $bot->answerCallbackQuery(text: '🔄 Pilihan tanggal di-reset');
+    $userId = $bot->userId() ?? 0;
+    \Illuminate\Support\Facades\Cache::forget("bs_pick_{$userId}_{$sym}");
+
+    $kb = $buildBrokerCalendar($sym, (int) $year, (int) $month, null);
+    $bot->editMessageText(
+        "📅 <b>PILIH TANGGAL BROKER SUMMARY: {$sym}</b>\n"
+        . "━━━━━━━━━━━━━━━━━━━━\n"
+        . "1️⃣ Klik <b>Tanggal Mulai (From)</b> pada kalender di bawah.",
+        parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML,
+        reply_markup: $kb
+    );
+});
+
+// Callback: Klik tanggal pada kalender (Klik 1 = Start Date, Klik 2 = End Date & Eksekusi)
+$bot->onCallbackQueryData('bscal:pick:{sym}:{date}', function (\SergiX44\Nutgram\Nutgram $bot, string $sym, string $date) use ($buildBrokerCalendar, $renderBrokerSummary) {
+    $userId = $bot->userId() ?? 0;
+    $cacheKey = "bs_pick_{$userId}_{$sym}";
+    $startDate = \Illuminate\Support\Facades\Cache::get($cacheKey);
+
+    if (!$startDate) {
+        // Langkah 1: Simpan Start Date
+        \Illuminate\Support\Facades\Cache::put($cacheKey, $date, 600);
+        $bot->answerCallbackQuery(text: "📌 Mulai: {$date}. Pilih tanggal akhir.");
+
+        $dt = \Carbon\Carbon::parse($date);
+        $kb = $buildBrokerCalendar($sym, $dt->year, $dt->month, $date);
+        $bot->editMessageText(
+            "📅 <b>PILIH TANGGAL BROKER SUMMARY: {$sym}</b>\n"
+            . "━━━━━━━━━━━━━━━━━━━━\n"
+            . "✅ <b>Tanggal Mulai:</b> <code>{$date}</code>\n"
+            . "2️⃣ Sekarang klik <b>Tanggal Akhir (To)</b> pada kalender (atau klik <code>[{$dt->day}]</code> lagi untuk 1 hari saja):",
+            parse_mode: \SergiX44\Nutgram\Telegram\Properties\ParseMode::HTML,
+            reply_markup: $kb
+        );
+    } else {
+        // Langkah 2: End Date terpilih -> Eksekusi Broker Summary
+        \Illuminate\Support\Facades\Cache::forget($cacheKey);
+        $fromDate = $startDate;
+        $toDate   = $date;
+        if ($fromDate > $toDate) {
+            [$fromDate, $toDate] = [$toDate, $fromDate];
+        }
+
+        $bot->answerCallbackQuery(text: "⏳ Mengambil data {$fromDate} s/d {$toDate}...");
+        $renderBrokerSummary($bot, $sym, $fromDate, $toDate, true);
+    }
+});
+
+// Callback dummy untuk label header kalender
+$bot->onCallbackQueryData('bscal:noop', function (\SergiX44\Nutgram\Nutgram $bot) {
+    $bot->answerCallbackQuery();
+});
+
+
 // Satu route tunggal untuk /analisa KODE maupun /analisa KODE NOMINAL_RISK
 
 $sendKronosForecast = function (Nutgram $bot, string $ticker, StockAnalysisService $service) {
@@ -729,6 +1053,7 @@ $bot->onCommand('setmenu', function (\SergiX44\Nutgram\Nutgram $bot) {
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('volume', 'Deteksi lonjakan volume hari ini'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('akumulasi', 'Deteksi saham akumulasi bandar'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('topritel', 'Screener Top Retail Jualan (Broker Summary)'),
+        new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('brokersum', 'Broker Summary & Bandar Detector (Kalender)'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('settoken', 'Update Bearer Token Stockbit'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('banding', 'Komparasi head-to-head emiten satu sektor'),
         new \SergiX44\Nutgram\Telegram\Types\Command\BotCommand('valuasi', 'Nilai wajar intrinsik & Margin of Safety'),
@@ -825,20 +1150,31 @@ $runBanding = function (Nutgram $bot, string $tickers) {
             return;
         }
 
-        $validPers = array_filter(array_column($items, 'per'), fn($v) => $v !== null && $v > 0);
-        $bestPer = !empty($validPers) ? min($validPers) : null;
+        $bankTickers = ['BBCA', 'BBRI', 'BMRI', 'BBNI', 'BRIS', 'BNGA', 'BDMN', 'BNII', 'NISP', 'BBTN', 'BJBR', 'BJTM', 'BTPS', 'ARTO', 'BBYB', 'AGRO', 'MEGA', 'PNBN', 'BTPN'];
 
-        $validPbvs = array_filter(array_column($items, 'pbv'), fn($v) => $v !== null && $v > 0);
-        $bestPbv = !empty($validPbvs) ? min($validPbvs) : null;
+        $isHealthy = function (array $row): bool {
+            $loss = ($row['roe'] !== null && $row['roe'] < 0) || ($row['npm'] !== null && $row['npm'] < 0) || $row['per'] === null || $row['per'] <= 0;
+            $deepDrop = ($row['earn_growth'] !== null && $row['earn_growth'] < -25);
+            return !$loss && !$deepDrop;
+        };
 
-        $validRoes = array_filter(array_column($items, 'roe'), fn($v) => $v !== null);
-        $bestRoe = !empty($validRoes) ? max($validRoes) : null;
+        $validPers = array_column(array_filter($items, fn($r) => $isHealthy($r) && $r['per'] !== null && $r['per'] > 0), 'per');
+        $bestPer = (count($validPers) >= 2 && min($validPers) <= 15) ? min($validPers) : null;
 
-        $validNpms = array_filter(array_column($items, 'npm'), fn($v) => $v !== null);
-        $bestNpm = !empty($validNpms) ? max($validNpms) : null;
+        $validPbvs = array_column(array_filter($items, fn($r) => $isHealthy($r) && $r['pbv'] !== null && $r['pbv'] > 0), 'pbv');
+        $bestPbv = (count($validPbvs) >= 2 && min($validPbvs) <= 2.5) ? min($validPbvs) : null;
 
-        $validDivs = array_filter(array_column($items, 'dividend_yield'), fn($v) => $v !== null);
-        $bestDiv = !empty($validDivs) ? max($validDivs) : null;
+        $validRoes = array_column(array_filter($items, fn($r) => $r['roe'] !== null && $r['roe'] > 0), 'roe');
+        $bestRoe = count($validRoes) >= 2 ? max($validRoes) : null;
+
+        $validNpms = array_column(array_filter($items, fn($r) => $r['npm'] !== null && $r['npm'] > 0), 'npm');
+        $bestNpm = count($validNpms) >= 2 ? max($validNpms) : null;
+
+        $validDivs = array_column(array_filter($items, fn($r) => $isHealthy($r) && $r['dividend_yield'] !== null && $r['dividend_yield'] > 0), 'dividend_yield');
+        $bestDiv = count($validDivs) >= 2 ? max($validDivs) : null;
+
+        $validEarns = array_column(array_filter($items, fn($r) => $r['earn_growth'] !== null && $r['earn_growth'] > 0), 'earn_growth');
+        $bestEarn = count($validEarns) >= 2 ? max($validEarns) : null;
 
         $msg = "⚖️ <b>KOMPARASI HEAD-TO-HEAD EMITEN</b>\n";
         $msg .= "━━━━━━━━━━━━━━━━━━━━\n\n";
@@ -854,14 +1190,55 @@ $runBanding = function (Nutgram $bot, string $tickers) {
             $score = $s['score'];
             $capFmt = $s['market_cap_formatted'];
             $priceFmt = number_format($s['price'], 0);
+            $isBank = in_array($sym, $bankTickers, true);
 
-            $perStr = $s['per'] !== null ? $s['per'] . 'x' . ($s['per'] === $bestPer ? ' 👑' : '') : 'N/A';
-            $pbvStr = $s['pbv'] !== null ? $s['pbv'] . 'x' . ($s['pbv'] === $bestPbv ? ' 👑' : '') : 'N/A';
-            $roeStr = $s['roe'] !== null ? $s['roe'] . '%' . ($s['roe'] === $bestRoe ? ' 👑' : '') : 'N/A';
-            $npmStr = $s['npm'] !== null ? $s['npm'] . '%' . ($s['npm'] === $bestNpm ? ' 👑' : '') : 'N/A';
-            $derStr = $s['der'] !== null ? $s['der'] . 'x' : 'N/A';
-            $divStr = $s['dividend_yield'] !== null ? $s['dividend_yield'] . '%' . ($s['dividend_yield'] === $bestDiv ? ' 👑' : '') : '-';
-            $earnStr = $s['earn_growth'] !== null ? (($s['earn_growth'] >= 0 ? '+' : '') . $s['earn_growth'] . '%') : 'N/A';
+            $isLoss = (($s['roe'] !== null && $s['roe'] < 0) || ($s['npm'] !== null && $s['npm'] < 0) || $s['per'] === null || $s['per'] <= 0);
+            $isDeepDrop = ($s['earn_growth'] !== null && $s['earn_growth'] < -25);
+            $isTrap = $isLoss || $isDeepDrop;
+
+            // PER
+            if ($s['per'] !== null && $s['per'] > 0) {
+                $perBadge = (!$isTrap && $s['per'] === $bestPer) ? ' 👑' : ($isDeepDrop ? ' ⚠️' : '');
+                $perStr = $s['per'] . 'x' . $perBadge;
+            } else {
+                $perStr = $isLoss ? 'N/A (Rugi) ⚠️' : 'N/A';
+            }
+
+            // PBV
+            if ($s['pbv'] !== null && $s['pbv'] > 0) {
+                $pbvBadge = (!$isTrap && $s['pbv'] === $bestPbv) ? ' 👑' : ($isLoss ? ' ⚠️' : '');
+                $pbvStr = $s['pbv'] . 'x' . $pbvBadge;
+            } else {
+                $pbvStr = 'N/A';
+            }
+
+            // ROE & NPM
+            $roeBadge = ($s['roe'] !== null && $s['roe'] < 0) ? ' ⚠️' : (($s['roe'] !== null && $s['roe'] === $bestRoe) ? ' 👑' : '');
+            $roeStr = $s['roe'] !== null ? $s['roe'] . '%' . $roeBadge : 'N/A';
+
+            $npmBadge = ($s['npm'] !== null && $s['npm'] < 0) ? ' ⚠️' : (($s['npm'] !== null && $s['npm'] === $bestNpm) ? ' 👑' : '');
+            $npmStr = $s['npm'] !== null ? $s['npm'] . '%' . $npmBadge : 'N/A';
+
+            // DER
+            if ($isBank) {
+                $derStr = $s['der'] !== null ? $s['der'] . 'x (Bank)' : 'N/A (Bank)';
+            } else {
+                $derWarn = ($s['der'] !== null && $s['der'] > 1.5) ? ' ⚠️' : '';
+                $derStr = $s['der'] !== null ? $s['der'] . 'x' . $derWarn : 'N/A';
+            }
+
+            // Laba YoY
+            $earnBadge = ($s['earn_growth'] !== null && $s['earn_growth'] < -25) ? ' ⚠️' : (($bestEarn !== null && $s['earn_growth'] === $bestEarn) ? ' 👑' : '');
+            $earnStr = $s['earn_growth'] !== null ? (($s['earn_growth'] >= 0 ? '+' : '') . $s['earn_growth'] . '%' . $earnBadge) : 'N/A';
+
+            // Dividen
+            if ($s['dividend_yield'] !== null && $s['dividend_yield'] > 0) {
+                $isTrailingDiv = $isLoss || ($s['earn_growth'] !== null && $s['earn_growth'] < -40);
+                $divBadge = (!$isTrap && $s['dividend_yield'] === $bestDiv) ? ' 👑' : ($isTrailingDiv ? ' ⚠️' : '');
+                $divStr = $s['dividend_yield'] . '%' . ($isTrailingDiv ? ' (Trailing)' : '') . $divBadge;
+            } else {
+                $divStr = '-';
+            }
 
             $msg .= "{$medal} <b>{$sym}</b> — Rp {$priceFmt} (Skor: <b>{$score}/100</b>)\n";
             $msg .= "   • Cap: {$capFmt} | DER: {$derStr}\n";
@@ -880,11 +1257,66 @@ $runBanding = function (Nutgram $bot, string $tickers) {
             $keyboard->addRow(...$btnRow);
         }
 
-        $winner = $items[0];
-        $winSym = $winner['symbol'];
-        $winScore = $winner['score'];
+        // Asumsi $items sudah terurut dari skor tertinggi & $bankTickers sudah didefinisikan
+        $winner   = $items[0];
+        $runnerUp = $items[1] ?? null;
+        $winSym   = $winner['symbol'];
+        $winScore = (int) $winner['score'];
+        $diff     = $runnerUp ? ($winScore - (int) $runnerUp['score']) : 0;
+
+        // 1. Deteksi keunggulan utama pemenang
+        $winStrengths = [];
+        $winIsBank = in_array($winSym, $bankTickers, true);
+
+        if (!$winIsBank && $winner['der'] !== null && $winner['der'] <= 1.0) {
+            $winStrengths[] = 'neraca sehat';
+        }
+        if ($winner['dividend_yield'] !== null && $winner['dividend_yield'] >= 5.0 && ($winner['earn_growth'] === null || $winner['earn_growth'] >= -40)) {
+            $winStrengths[] = 'dividen menarik';
+        }
+        if ($winner['roe'] !== null && $winner['roe'] >= 15.0) {
+            $winStrengths[] = 'profitabilitas solid';
+        }
+        if ($winner['earn_growth'] !== null && $winner['earn_growth'] >= 10.0) {
+            $winStrengths[] = 'pertumbuhan laba kuat';
+        }
+        $strengthText = !empty($winStrengths)
+            ? implode(' &amp; ', array_slice($winStrengths, 0, 2))
+            : 'profil risiko lebih terjaga';
+
+        // 2. Deteksi risiko utama runner-up (jika ada)
+        $runnerRisk = '';
+        if ($runnerUp) {
+            $rIsBank = in_array($runnerUp['symbol'], $bankTickers, true);
+            $rIsLoss = ($runnerUp['roe'] !== null && $runnerUp['roe'] < 0) || ($runnerUp['npm'] !== null && $runnerUp['npm'] < 0);
+
+            if ($rIsLoss) {
+                $runnerRisk = "{$runnerUp['symbol']} masih merugi";
+            } elseif ($runnerUp['earn_growth'] !== null && $runnerUp['earn_growth'] < -25) {
+                $runnerRisk = "{$runnerUp['symbol']} terbebani kontraksi laba tajam";
+            } elseif (!$rIsBank && $runnerUp['der'] !== null && $runnerUp['der'] > 1.5) {
+                $runnerRisk = "{$runnerUp['symbol']} memiliki beban utang tinggi";
+            }
+        }
+
+        // 3. Rangkai 1 kalimat kesimpulan berdasarkan selisih skor
+        if ($winScore < 45) {
+            $summary = "Seluruh emiten di grup ini masih berisiko tinggi (skor &lt; 45); sebaiknya tunggu perbaikan fundamental.";
+        } elseif ($runnerUp && $diff <= 5) {
+            $summary = "Persaingan sangat ketat dengan {$runnerUp['symbol']} (selisih {$diff} poin); {$winSym} sedikit lebih unggul lewat {$strengthText}.";
+        } elseif ($runnerUp && $diff >= 20) {
+            $riskClause = $runnerRisk ? ", sementara {$runnerRisk}" : '';
+            $summary = "{$winSym} unggul telak (+{$diff} poin) berkat {$strengthText}{$riskClause}.";
+        } elseif ($runnerUp) {
+            $riskClause = $runnerRisk ? " dibandingkan {$runnerRisk}" : " atas {$runnerUp['symbol']}";
+            $summary = "{$winSym} memimpin (+{$diff} poin) dengan {$strengthText}{$riskClause}.";
+        } else {
+            $summary = "{$winSym} mencatatkan skor {$winScore}/100 dengan {$strengthText}.";
+        }
+
         $msg .= "🏆 <b>Unggul Keseluruhan: {$winSym}</b> (Skor {$winScore}/100)\n";
-        $msg .= "<i>👑 = Metrik terbaik di grup perbandingan ini.</i>";
+        $msg .= "💡 <i>{$summary}</i>\n";
+        $msg .= "<i>👑 = Terbaik (lolos filter) | ⚠️ = Risiko trap / negatif</i>";
 
         $bot->sendMessage($msg, parse_mode: ParseMode::HTML, reply_markup: $keyboard);
     } catch (\Exception $e) {
@@ -1003,6 +1435,7 @@ $helpAudit = function (Nutgram $bot) {
 $bot->onCommand('audit {ticker}', $runAudit);
 $bot->onCommand('Audit {ticker}', $runAudit);
 $bot->onCommand('audit', $helpAudit);
+
 $bot->onCommand('Audit', $helpAudit);
 
 // Callback tombol inline untuk lompat cepat antar Valuasi & Audit
