@@ -8,11 +8,13 @@ use App\Models\Watchlist;
 use App\Services\StockAnalysisService;
 use SergiX44\Nutgram\Nutgram;
 use SergiX44\Nutgram\Telegram\Properties\ParseMode;
+use SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup;
+use SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton;
 
 class CheckStockAlerts extends Command
 {
     protected $signature = 'stocks:check-alerts {--test : Jalankan simulasi alert sekarang di luar jam bursa}';
-    protected $description = 'Memeriksa watchlist saham dan mengirim alert otomatis ke Telegram';
+    protected $description = 'Memeriksa smart watchlist saham (BoW, BoB, SL, Vol) dan mengirim alert otomatis ke Telegram';
 
     public function handle(StockAnalysisService $service)
     {
@@ -35,64 +37,85 @@ class CheckStockAlerts extends Command
         foreach ($watchlists as $item) {
             $symbol = $item->symbol;
             $chatId = $item->telegram_id;
+            $mode   = strtolower((string) ($item->alert_mode ?: 'all'));
+            $minVol = (float) ($item->min_vol_ratio ?: 1.2);
 
             try {
                 $data = $service->analyze($symbol);
-                @unlink($data['chart_path']);
+                if (!empty($data['chart_path']) && file_exists($data['chart_path'])) {
+                    @unlink($data['chart_path']);
+                }
 
-                $price = $data['price'];
-                $r1 = $data['r1'] ?? 0;
-                $sl = $data['stoploss'] ?? 0;
-                $volRatio = $data['vol_ratio'] ?? 0;
-                $chg = $data['change_pct'];
+                $price    = (float) ($data['price'] ?? 0);
+                $bowLevel = (float) ($item->target_bow ?: ($data['s1'] ?? 0));
+                $bobLevel = (float) ($item->target_bob ?: ($data['r1'] ?? 0));
+                $slLevel  = (float) ($item->target_sl  ?: ($data['stoploss'] ?? 0));
+                $volRatio = (float) ($data['vol_ratio'] ?? 0);
+                $volTag   = !empty($data['vol_is_projected']) ? ' Est.' : '';
+                $chg      = (float) ($data['change_pct'] ?? 0);
+
                 $priceFmt = number_format($price, 0, ',', '.');
-                $r1Fmt = number_format($r1, 0, ',', '.');
-                $slFmt = number_format($sl, 0, ',', '.');
+                $bowFmt   = number_format($bowLevel, 0, ',', '.');
+                $bobFmt   = number_format($bobLevel, 0, ',', '.');
+                $slFmt    = number_format($slLevel, 0, ',', '.');
 
                 $alerts = [];
 
-                if ($r1 > 0 && $price >= $r1) {
-                    if ($isTest || Cache::add("alert:{$todayKey}:{$chatId}:{$symbol}:R1", true, $now->copy()->endOfDay())) {
-                        $alerts[] = "🎯 <b>Menyentuh/Tembus Target R1</b> (Rp {$r1Fmt})";
+                if (in_array($mode, ['bow', 'both'], true) && $bowLevel > 0 && $price <= $bowLevel && ($slLevel <= 0 || $price > $slLevel)) {
+                    if ($isTest || Cache::add("alert:{$todayKey}:{$chatId}:{$symbol}:BOW", true, $now->copy()->endOfDay())) {
+                        $alerts[] = "🟢 <b>Masuk Area BoW</b> (≤ Rp {$bowFmt} • Vol {$volRatio}x{$volTag})";
                     }
                 }
 
-                if ($sl > 0 && $price <= $sl) {
+                if (in_array($mode, ['bob', 'both'], true) && $bobLevel > 0 && $price >= $bobLevel && $volRatio >= $minVol) {
+                    if ($isTest || Cache::add("alert:{$todayKey}:{$chatId}:{$symbol}:BOB", true, $now->copy()->endOfDay())) {
+                        $alerts[] = "🚀 <b>Breakout BoB Terkonfirmasi</b> (≥ Rp {$bobFmt} • Vol {$volRatio}x{$volTag})";
+                    }
+                }
+
+                if ($mode === 'all') {
+                    if ($bobLevel > 0 && $price >= $bobLevel) {
+                        if ($isTest || Cache::add("alert:{$todayKey}:{$chatId}:{$symbol}:R1", true, $now->copy()->endOfDay())) {
+                            $alerts[] = "🎯 <b>Menyentuh/Tembus Target R1</b> (Rp {$bobFmt})";
+                        }
+                    }
+                    if ($volRatio >= 2.0 && $chg > 0) {
+                        if ($isTest || Cache::add("alert:{$todayKey}:{$chatId}:{$symbol}:VOL", true, $now->copy()->endOfDay())) {
+                            $alerts[] = "🔥 <b>Breakout Volume {$volRatio}x{$volTag}</b> (+{$chg}%)";
+                        }
+                    }
+                }
+
+                if ($slLevel > 0 && $price <= $slLevel) {
                     if ($isTest || Cache::add("alert:{$todayKey}:{$chatId}:{$symbol}:SL", true, $now->copy()->endOfDay())) {
                         $alerts[] = "🛑 <b>Menyentuh Batas Stoploss</b> (Rp {$slFmt})";
                     }
                 }
 
-                if ($volRatio >= 2.0 && $chg > 0) {
-                    if ($isTest || Cache::add("alert:{$todayKey}:{$chatId}:{$symbol}:VOL", true, $now->copy()->endOfDay())) {
-                        $alerts[] = "🔥 <b>Breakout Volume {$volRatio}x</b> (+{$chg}%)";
-                    }
-                }
-
                 if ($isTest && empty($alerts)) {
-                    $alerts[] = "🧪 <b>[MODE SIMULASI]</b> Belum ada sinyal aktif (R1: Rp {$r1Fmt} • SL: Rp {$slFmt} • Vol: {$volRatio}x)";
+                    $alerts[] = "🧪 <b>[SIMULASI - " . strtoupper($mode) . "]</b> Belum terpicu (BoW: Rp {$bowFmt} • BoB: Rp {$bobFmt} • SL: Rp {$slFmt} • Vol: {$volRatio}x{$volTag})";
                 }
 
                 if (!empty($alerts)) {
                     $alertList = implode("\n• ", $alerts);
-                    $header = $isTest ? "🧪 <b>SIMULASI ALERT WATCHLIST: {$symbol}</b>" : "🚨 <b>ALERT WATCHLIST: {$symbol}</b>";
-
+                    $header = $isTest
+                        ? "🧪 <b>SIMULASI SMART ALERT: {$symbol}</b>"
+                        : "🚨 <b>SMART ALERT WATCHLIST: {$symbol}</b>";
+                    $kb = InlineKeyboardMarkup::make()->addRow(
+                        InlineKeyboardButton::make("📊 Buka Chart {$symbol}", callback_data: "chart:{$symbol}")
+                    );
                     $bot->sendMessage(
                         chat_id: $chatId,
-                        text: "{$header}\n" .
-                              "━━━━━━━━━━━━━━━━━━━━\n" .
-                              "💰 Harga Saat Ini: <b>Rp {$priceFmt}</b>\n" .
-                              "• {$alertList}\n\n" .
-                              "💡 Ketik <code>/analisa {$symbol}</code> untuk melihat chart.",
-                        parse_mode: ParseMode::HTML
+                        text: "{$header}\n━━━━━━━━━━━━━━━━━━━━\n💰 Harga Saat Ini: <b>Rp {$priceFmt}</b> (" . ($chg >= 0 ? '+' : '') . "{$chg}%)\n• {$alertList}\n\n💡 Klik tombol di bawah untuk cek chart &amp; broker flow terbaru.",
+                        parse_mode: ParseMode::HTML,
+                        reply_markup: $kb
                     );
-                    $this->info("Alert terkirim untuk {$symbol} ke chat ID {$chatId}");
+                    $this->info("Alert terkirim untuk {$symbol} ({$mode}) ke chat ID {$chatId}");
                 }
             } catch (\Exception $e) {
                 $this->error("Gagal memeriksa {$symbol}: " . $e->getMessage());
                 continue;
             }
-
             usleep(1000000);
         }
 

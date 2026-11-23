@@ -116,20 +116,37 @@ class MarketSessionReportService
 
         // Gabungkan Top Value + Top Gainer + Lonjakan Volume agar emiten penggerak pasar ikut terpindai Foreign & Local Buy
         $byValue = $records;
-        uasort($byValue, fn($a, $b) => ($b['close'] * $b['today_vol']) <=> ($a['close'] * $a['today_vol']));
+        uasort($byValue, fn($a, $b) => ($b['today_val'] ?? ($b['close'] * $b['today_vol'])) <=> ($a['today_val'] ?? ($a['close'] * $a['today_vol'])));
+        $topValues = [];
+        foreach (array_slice($byValue, 0, 5, true) as $sym => $rec) {
+            $valIdr = (float) ($rec['today_val'] ?? ($rec['close'] * $rec['today_vol']));
+            if ($valIdr > 0) {
+                $topValues[$sym] = [
+                    'symbol'     => $sym,
+                    'val_b'      => round($valIdr / 1_000_000_000, 2),
+                    'change_pct' => $rec['change_pct'] ?? 0.0,
+                ];
+            }
+        }
         $topValSyms = array_keys(array_slice($byValue, 0, 18, true));
         $topGainSyms = array_keys(array_slice(array_filter($sortedByChange, fn($r) => $r['change_pct'] > 0), 0, 12, true));
         $activeSymbols = array_values(array_unique(array_merge($topValSyms, $topGainSyms)));
 
         $activeTradeDate = $this->resolveLatestTradeDate($token);
-        $prevTradeDate = $this->resolvePreviousTradeDate($activeTradeDate);
+        $todayStr        = $now->format('Y-m-d');
+        // Saat Sesi 1 (broker summary hari ini belum terbit), $activeTradeDate sudah merupakan hari bursa kemarin.
+        $followTradeDate = ($activeTradeDate < $todayStr)
+            ? $activeTradeDate
+            : $this->resolvePreviousTradeDate($activeTradeDate);
 
         $topForeignBuy = $this->fetchTopInvestorNetBuy($token, $activeSymbols, $activeTradeDate, 'INVESTOR_TYPE_FOREIGN', $records);
         $topLocalBuy   = $this->fetchTopInvestorNetBuy($token, $activeSymbols, $activeTradeDate, 'INVESTOR_TYPE_DOMESTIC', $records);
-        $foreignFollow = $this->fetchForeignFollowThrough($token, $sortedByChange, $prevTradeDate);
+        $foreignFollow = $this->fetchForeignFollowThrough($token, $sortedByChange, $followTradeDate);
+
+        $reportTitle = $now->hour >= 16 ? 'MARKET REPORT CLOSING' : 'MARKET REPORT SESI 1';
 
         $report = $this->formatReport(
-            $now->format('d M Y H:i') . ' WIB',
+            $now->format('d M Y • H:i') . ' WIB',
             $ihsgChange,
             $topGainers,
             $topLosers,
@@ -139,7 +156,10 @@ class MarketSessionReportService
             $foreignFollow,
             $rebound3d,
             $volSpikes,
-            !empty($token) ? 'Stockbit Real-Time' : 'Yahoo Finance'
+            !empty($token) ? 'Stockbit Real-Time' : 'Yahoo Finance',
+            $followTradeDate,
+            $topValues,
+            $reportTitle
         );
 
         Cache::put($cacheKey, $report, now('Asia/Jakarta')->addMinutes(25));
@@ -358,11 +378,17 @@ class MarketSessionReportService
             }
         }
 
+        $todayVal = (float) ($today['value'] ?? 0);
+        if ($todayVal <= 0) {
+            $todayVal = $close * $todayVol;
+        }
+
         return [
             'symbol' => $sym,
             'close' => $close,
             'change_pct' => round($changePct, 2),
             'today_vol' => $todayVol,
+            'today_val' => $todayVal,
             'rvol' => round($rvol, 1),
             'down_streak' => $downStreak,
         ];
@@ -410,6 +436,7 @@ class MarketSessionReportService
             'close' => $close,
             'change_pct' => round($changePct, 2),
             'today_vol' => $todayVol,
+            'today_val' => $close * $todayVol,
             'rvol' => round($rvol, 1),
             'down_streak' => $downStreak,
         ];
@@ -494,100 +521,190 @@ class MarketSessionReportService
         array $foreignFollow,
         array $rebound3d,
         array $volSpikes,
-        string $source
+        string $source,
+        ?string $followDate = null,
+        array $topValues = [],
+        string $reportTitle = 'MARKET REPORT SESI 1'
     ): string {
+        $fmtPct = static function (float|int $pct): string {
+            $val = (float) $pct;
+            $sign = $val > 0 ? '+' : '';
+            return $sign . number_format($val, 2, '.', '') . '%';
+        };
+
+        $fmtBillion = static function (float|int $netB): string {
+            $val = abs((float) $netB);
+            if ($val >= 1000) {
+                return 'Rp ' . number_format($val / 1000, 2, ',', '.') . ' T';
+            }
+            if ($val < 1) {
+                return 'Rp ' . number_format($val * 1000, 0, ',', '.') . ' Jt';
+            }
+            return 'Rp ' . number_format($val, 1, ',', '.') . ' M';
+        };
+
         $lines = [];
-        $lines[] = "📊 <b>MARKET REPORT SESI 1</b>";
+        $lines[] = "📊 <b>{$reportTitle}</b>";
         $lines[] = "🕒 <i>{$timestamp}</i>";
-        $lines[] = "━━━━━━━━━━━━━━━━━━━━";
+        $lines[] = "━━━━━━━━━━━━━━━━━━";
 
         if ($ihsgData !== null) {
-            $lvl = number_format($ihsgData['price'], 2, ',', '.');
-            $pct = $ihsgData['change_pct'];
-            $dir = $pct >= 0 ? "🟢 naik <b>+{$pct}%</b>" : "🔴 turun <b>{$pct}%</b>";
-            $lines[] = "🏛 <b>IHSG: {$lvl}</b> ({$dir})";
+            $lvl    = number_format((float) $ihsgData['price'], 2, ',', '.');
+            $pct    = (float) $ihsgData['change_pct'];
+            $icon   = $pct >= 0 ? '🟢' : '🔴';
+            $pctStr = $fmtPct($pct);
+            $lines[] = "🏛 <b>IHSG:</b> <code>{$lvl}</code> (<b>{$icon} {$pctStr}</b>)";
         } else {
-            $lines[] = "🏛 <b>IHSG</b>: Data indeks belum tersedia.";
+            $lines[] = "🏛 <b>IHSG:</b> <i>Data indeks belum tersedia</i>";
         }
 
         $lines[] = "";
-        $lines[] = "🚀 <b>Top Gainer:</b>";
+        $lines[] = "🚀 <b>Top Gainer</b>";
         if (empty($topGainers)) {
             $lines[] = "• <i>Tidak ada data</i>";
         } else {
             foreach ($topGainers as $r) {
-                $lines[] = "• <b>{$r['symbol']}</b>: +{$r['change_pct']}% (Rp " . number_format($r['close'], 0, ',', '.') . ")";
+                $pctStr = $fmtPct($r['change_pct']);
+                $price  = number_format((float) $r['close'], 0, ',', '.');
+                $lines[] = "• <code>{$r['symbol']}</code> <b>{$pctStr}</b> · Rp {$price}";
             }
         }
 
         $lines[] = "";
-        $lines[] = "🔻 <b>Top Loser:</b>";
+        $lines[] = "🔻 <b>Top Loser</b>";
         if (empty($topLosers)) {
             $lines[] = "• <i>Tidak ada data</i>";
         } else {
             foreach ($topLosers as $r) {
-                $lines[] = "• <b>{$r['symbol']}</b>: {$r['change_pct']}% (Rp " . number_format($r['close'], 0, ',', '.') . ")";
+                $pctStr = $fmtPct($r['change_pct']);
+                $price  = number_format((float) $r['close'], 0, ',', '.');
+                $lines[] = "• <code>{$r['symbol']}</code> <b>{$pctStr}</b> · Rp {$price}";
             }
         }
 
-        $flowDateLabel = \Carbon\Carbon::parse($flowDate)->format('d M');
+        if (!empty($topValues)) {
+            $lines[] = "";
+            $lines[] = "💰 <b>Top Value (Live)</b>";
+            foreach ($topValues as $r) {
+                $valStr = $fmtBillion($r['val_b']);
+                $pctStr = $fmtPct($r['change_pct']);
+                $lines[] = "• <code>{$r['symbol']}</code> <b>{$valStr}</b> ({$pctStr})";
+            }
+        }
+
+        $flowDateLabel   = \Carbon\Carbon::parse($flowDate)->format('d M');
+        $followDateLabel = \Carbon\Carbon::parse($followDate ?: $flowDate)->format('d M');
 
         $lines[] = "";
-        $lines[] = "🌍 <b>Top Foreign Buy ({$flowDateLabel}):</b>";
+        $lines[] = "🌍 <b>Top Foreign Buy ({$flowDateLabel})</b>";
         if (empty($topForeignBuy)) {
             $lines[] = "• <i>Belum ada net foreign buy signifikan</i>";
         } else {
             foreach ($topForeignBuy as $r) {
-                $sign = $r['change_pct'] > 0 ? '+' : '';
-                $lines[] = "• <b>{$r['symbol']}</b>: Net Buy <b>Rp {$r['net_b']} M</b> ({$sign}{$r['change_pct']}%)";
+                $valStr = $fmtBillion($r['net_b']);
+                $pctStr = $fmtPct($r['change_pct']);
+                $lines[] = "• <code>{$r['symbol']}</code> <b>{$valStr}</b> ({$pctStr})";
             }
         }
 
         $lines[] = "";
-        $lines[] = "🏠 <b>Top Local Buy ({$flowDateLabel}):</b>";
+        $lines[] = "🏠 <b>Top Local Buy ({$flowDateLabel})</b>";
         if (empty($topLocalBuy)) {
             $lines[] = "• <i>Belum ada net local buy signifikan</i>";
         } else {
             foreach ($topLocalBuy as $r) {
-                $sign = $r['change_pct'] > 0 ? '+' : '';
-                $lines[] = "• <b>{$r['symbol']}</b>: Net Buy <b>Rp {$r['net_b']} M</b> ({$sign}{$r['change_pct']}%)";
+                $valStr = $fmtBillion($r['net_b']);
+                $pctStr = $fmtPct($r['change_pct']);
+                $lines[] = "• <code>{$r['symbol']}</code> <b>{$valStr}</b> ({$pctStr})";
             }
         }
 
         $lines[] = "";
-        $lines[] = "🔥 <b>Naik Setelah Asing Beli Kemarin:</b>";
+        $lines[] = "🔥 <b>Naik Pasca Asing Beli ({$followDateLabel})</b>";
         if (empty($foreignFollow)) {
-            $lines[] = "• <i>Belum terdeteksi follow-through net buy asing</i>";
+            $lines[] = "• <i>Belum terdeteksi follow-through asing</i>";
         } else {
             foreach ($foreignFollow as $r) {
-                $lines[] = "• <b>{$r['symbol']}</b>: +{$r['change_pct']}% / Net Buy Kemarin <b>Rp {$r['net_foreign_b']} M</b>";
+                $pctStr = $fmtPct($r['change_pct']);
+                $valStr = $fmtBillion($r['net_foreign_b']);
+                $lines[] = "• <code>{$r['symbol']}</code> <b>{$pctStr}</b> · Asing {$valStr}";
             }
         }
 
         $lines[] = "";
-        $lines[] = "🔄 <b>Rebound Setelah Turun ≥3 Hari:</b>";
+        $lines[] = "🔄 <b>Rebound Pasca Turun ≥3 Hari</b>";
         if (empty($rebound3d)) {
-            $lines[] = "• <i>Belum ada kandidat technical rebound 3D</i>";
+            $lines[] = "• <i>Belum ada kandidat rebound 3D</i>";
         } else {
             foreach ($rebound3d as $r) {
-                $lines[] = "• <b>{$r['symbol']}</b>: +{$r['change_pct']}% (<i>turun {$r['down_streak']} hari beruntun</i>)";
+                $pctStr = $fmtPct($r['change_pct']);
+                $lines[] = "• <code>{$r['symbol']}</code> <b>{$pctStr}</b> <i>({$r['down_streak']}H merah)</i>";
             }
         }
 
         $lines[] = "";
-        $lines[] = "💥 <b>Lonjakan Volume:</b>";
+        $lines[] = "💥 <b>Lonjakan Volume</b>";
         if (empty($volSpikes)) {
             $lines[] = "• <i>Belum ada lonjakan volume &gt;= 2x</i>";
         } else {
             foreach ($volSpikes as $r) {
-                $sign = $r['change_pct'] > 0 ? '+' : '';
-                $lines[] = "• <b>{$r['symbol']}</b>: <b>{$r['rvol']}x</b> ({$sign}{$r['change_pct']}%)";
+                $rvol   = number_format((float) $r['rvol'], 1, '.', '');
+                $pctStr = $fmtPct($r['change_pct']);
+                $lines[] = "• <code>{$r['symbol']}</code> <b>{$rvol}x</b> ({$pctStr})";
             }
         }
 
         $lines[] = "";
-        $lines[] = "📡 <i>Sumber: {$source} | Ketik /analisa KODE untuk bedah chart</i>";
+        $lines[] = "━━━━━━━━━━━━━━━━━━";
+        $lines[] = "📡 <i>{$source}</i>";
+        $lines[] = "💡 Ketik <code>/analisa KODE</code> untuk bedah chart";
 
         return implode("\n", $lines);
+    }
+
+    public function buildTelegramKeyboard(string $report): ?\SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup
+    {
+        $blocks = preg_split('/\R\R+/', $report) ?: [];
+
+        $categories = [
+            ['keyword' => 'Top Gainer',            'icon' => '🚀', 'limit' => 4],
+            ['keyword' => 'Top Value',             'icon' => '💰', 'limit' => 4],
+            ['keyword' => 'Top Foreign Buy',       'icon' => '🌍', 'limit' => 4],
+            ['keyword' => 'Naik Pasca Asing Beli', 'icon' => '🔥', 'limit' => 4],
+            ['keyword' => 'Rebound Pasca Turun',   'icon' => '🔄', 'limit' => 4],
+            ['keyword' => 'Lonjakan Volume',       'icon' => '💥', 'limit' => 4],
+        ];
+
+        $keyboard = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardMarkup::make();
+        $rowCount = 0;
+
+        foreach ($categories as $cat) {
+            $symbols = [];
+            foreach ($blocks as $block) {
+                if (str_contains($block, $cat['keyword'])) {
+                    if (preg_match_all('/•\s*<code>([A-Z]{4})<\/code>/u', $block, $m)) {
+                        $symbols = array_slice(array_values(array_unique($m[1])), 0, $cat['limit']);
+                    }
+                    break;
+                }
+            }
+
+            if (empty($symbols)) {
+                continue;
+            }
+
+            $rowButtons = [];
+            foreach ($symbols as $s) {
+                $rowButtons[] = \SergiX44\Nutgram\Telegram\Types\Keyboard\InlineKeyboardButton::make(
+                    "{$cat['icon']} {$s}",
+                    callback_data: "chart:{$s}"
+                );
+            }
+
+            $keyboard->addRow(...$rowButtons);
+            $rowCount++;
+        }
+
+        return $rowCount > 0 ? $keyboard : null;
     }
 }

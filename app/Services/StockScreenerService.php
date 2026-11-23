@@ -1260,9 +1260,14 @@ class StockScreenerService
         return number_format($cap);
     }
 
-    public function scanIntradayRadar(): array
+    public function scanIntradayRadar(bool $forceRefresh = false): array
     {
-        return Cache::remember('idx_intraday_radar_v4', 180, function () {
+        $cacheKey = 'idx_intraday_radar_v5';
+        if ($forceRefresh) {
+            Cache::forget($cacheKey);
+        }
+
+        return Cache::remember($cacheKey, 60, function () {
             $universe = [
                 'BBCA', 'BBRI', 'BMRI', 'BBNI', 'BRIS',
                 'ADRO', 'PTBA', 'ITMG', 'PGAS', 'MEDC',
@@ -1270,105 +1275,331 @@ class StockScreenerService
                 'TLKM', 'ISAT', 'EXCL', 'ASII', 'UNTR', 'AMRT',
             ];
 
-            $responses = Http::pool(function (Pool $pool) use ($universe) {
-                $reqs = [];
+            $nowWib   = now('Asia/Jakarta');
+            $todayWib = $nowWib->format('Y-m-d');
+            $nowTs    = $nowWib->timestamp;
+            $fromTs   = $nowTs;
+            $toTs     = $nowWib->copy()->subDays(8)->timestamp;
+
+            $parsedMap = [];
+
+            // 1. Sumber Utama: Stockbit Real-Time Intraday (1m -> agregasi 15m)
+            $token = $this->getStockbitToken();
+            if (!empty($token)) {
+                $sbResponses = Http::pool(function (Pool $pool) use ($universe, $token, $fromTs, $toTs) {
+                    $reqs = [];
+                    foreach ($universe as $sym) {
+                        $reqs[$sym] = $pool->as($sym)
+                            ->withToken($token)
+                            ->connectTimeout(4)
+                            ->timeout(8)
+                            ->withOptions(['force_ip_resolve' => 'v4'])
+                            ->withHeaders([
+                                'Origin'     => 'https://stockbit.com',
+                                'Referer'    => 'https://stockbit.com/',
+                                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                            ])
+                            ->get("https://exodus.stockbit.com/chartbit/{$sym}/price/intraday", [
+                                'from'  => $fromTs,
+                                'to'    => $toTs,
+                                'limit' => 1800,
+                            ]);
+                    }
+                    return $reqs;
+                });
+
                 foreach ($universe as $sym) {
-                    $url = "https://query1.finance.yahoo.com/v8/finance/chart/{$sym}.JK?range=5d&interval=15m";
-                    $reqs[$sym] = $pool->as($sym)
-                        ->connectTimeout(4)
-                        ->timeout(7)
-                        ->withOptions(['force_ip_resolve' => 'v4'])
-                        ->withHeaders([
-                            'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                        ])
-                        ->get($url);
-                }
-                return $reqs;
-            });
+                    $res = $sbResponses[$sym] ?? null;
+                    if (!$res || $res instanceof \Throwable || $res->failed()) {
+                        continue;
+                    }
 
-            $candidates = [];
+                    $rows = $res->json('data.chartbit') ?? $res->json('data.prices') ?? [];
+                    if (!is_array($rows) || count($rows) < 20) {
+                        continue;
+                    }
 
-            foreach ($universe as $sym) {
-                $res = $responses[$sym] ?? null;
-                if (!$res || $res instanceof \Throwable || $res->failed()) {
-                    continue;
-                }
+                    usort($rows, function ($a, $b) {
+                        $ta = (int) ($a['unix_timestamp'] ?? strtotime((string) ($a['datetime'] ?? '1970-01-01')));
+                        $tb = (int) ($b['unix_timestamp'] ?? strtotime((string) ($b['datetime'] ?? '1970-01-01')));
+                        return $ta <=> $tb;
+                    });
 
-                $result = $res->json('chart.result.0');
-                $meta = $result['meta'] ?? [];
-                $timestamps = $result['timestamp'] ?? [];
-                $quote = $result['indicators']['quote'][0] ?? [];
+                    $buckets = [];
+                    foreach ($rows as $r) {
+                        $c = (float) ($r['close'] ?? 0);
+                        $v = (float) ($r['volume'] ?? 0);
+                        if ($c <= 0 || $v <= 0) {
+                            continue;
+                        }
+                        $o   = (float) ($r['open'] ?? $c);
+                        $h   = (float) ($r['high'] ?? $c);
+                        $l   = (float) ($r['low'] ?? $c);
+                        $val = (float) ($r['value'] ?? 0);
+                        if ($val <= 0) {
+                            $val = $c * $v;
+                        }
 
-                $opens = $quote['open'] ?? [];
-                $highs = $quote['high'] ?? [];
-                $lows = $quote['low'] ?? [];
-                $closes = $quote['close'] ?? [];
-                $volumes = $quote['volume'] ?? [];
+                        $dtStr = (string) ($r['datetime'] ?? '');
+                        $ts    = (int) ($r['unix_timestamp'] ?? 0);
+                        if (strlen($dtStr) >= 16) {
+                            $date = substr($dtStr, 0, 10);
+                            $hh   = (int) substr($dtStr, 11, 2);
+                            $mm   = (int) substr($dtStr, 14, 2);
+                            $hhmm = substr($dtStr, 11, 5);
+                        } elseif ($ts > 0) {
+                            $dtObj = \Carbon\Carbon::createFromTimestamp($ts, 'Asia/Jakarta');
+                            $date  = $dtObj->format('Y-m-d');
+                            $hh    = (int) $dtObj->format('H');
+                            $mm    = (int) $dtObj->format('i');
+                            $hhmm  = $dtObj->format('H:i');
+                        } else {
+                            continue;
+                        }
 
-                $candles = [];
-                $count = count($closes);
-                for ($i = 0; $i < $count; $i++) {
-                    if (
-                        isset($closes[$i], $volumes[$i]) &&
-                        $closes[$i] > 0 && $volumes[$i] > 0
-                    ) {
-                        $candles[] = [
-                            't' => $timestamps[$i] ?? null,
-                            'o' => (float) ($opens[$i] ?? $closes[$i]),
-                            'h' => (float) ($highs[$i] ?? $closes[$i]),
-                            'l' => (float) ($lows[$i] ?? $closes[$i]),
-                            'c' => (float) $closes[$i],
-                            'v' => (float) $volumes[$i],
+                        $bMin      = (int) (floor($mm / 15) * 15);
+                        $slot      = sprintf('%02d:%02d', $hh, $bMin);
+                        $bucketKey = "{$date} {$slot}";
+                        $bucketTs  = strtotime("{$bucketKey}:00 Asia/Jakarta") ?: $ts;
+
+                        if (!isset($buckets[$bucketKey])) {
+                            $buckets[$bucketKey] = [
+                                'date'      => $date,
+                                'slot'      => $slot,
+                                'last_hhmm' => $hhmm,
+                                'bucket_ts' => $bucketTs,
+                                'o'         => $o ?: $c,
+                                'h'         => $h ?: $c,
+                                'l'         => $l ?: $c,
+                                'c'         => $c,
+                                'v'         => $v,
+                                'val'       => $val,
+                            ];
+                        } else {
+                            $buckets[$bucketKey]['h']         = max($buckets[$bucketKey]['h'], $h ?: $c);
+                            $buckets[$bucketKey]['l']         = min($buckets[$bucketKey]['l'], $l ?: $c);
+                            $buckets[$bucketKey]['c']         = $c;
+                            $buckets[$bucketKey]['v']        += $v;
+                            $buckets[$bucketKey]['val']      += $val;
+                            $buckets[$bucketKey]['last_hhmm'] = $hhmm;
+                        }
+                    }
+
+                    if (count($buckets) >= 10) {
+                        ksort($buckets);
+                        $parsedMap[$sym] = [
+                            'source'  => 'Stockbit',
+                            'candles' => array_values($buckets),
                         ];
                     }
                 }
+            }
 
-                $n = count($candles);
-                if ($n < 16) {
+            // 2. Fallback Otomatis: Yahoo Finance (15m) hanya untuk simbol yang gagal di Stockbit
+            $missing = array_values(array_diff($universe, array_keys($parsedMap)));
+            if (!empty($missing)) {
+                $yResponses = Http::pool(function (Pool $pool) use ($missing) {
+                    $reqs = [];
+                    foreach ($missing as $sym) {
+                        $url = "https://query1.finance.yahoo.com/v8/finance/chart/{$sym}.JK?range=5d&interval=15m";
+                        $reqs[$sym] = $pool->as($sym)
+                            ->connectTimeout(4)
+                            ->timeout(7)
+                            ->withOptions(['force_ip_resolve' => 'v4'])
+                            ->withHeaders([
+                                'User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                            ])
+                            ->get($url);
+                    }
+                    return $reqs;
+                });
+
+                foreach ($missing as $sym) {
+                    $res = $yResponses[$sym] ?? null;
+                    if (!$res || $res instanceof \Throwable || $res->failed()) {
+                        continue;
+                    }
+
+                    $result     = $res->json('chart.result.0');
+                    $timestamps = $result['timestamp'] ?? [];
+                    $quote      = $result['indicators']['quote'][0] ?? [];
+                    $opens      = $quote['open'] ?? [];
+                    $highs      = $quote['high'] ?? [];
+                    $lows       = $quote['low'] ?? [];
+                    $closes     = $quote['close'] ?? [];
+                    $volumes    = $quote['volume'] ?? [];
+
+                    $candles = [];
+                    $cnt = count($closes);
+                    for ($i = 0; $i < $cnt; $i++) {
+                        if (!isset($closes[$i], $volumes[$i], $timestamps[$i]) || $closes[$i] <= 0 || $volumes[$i] <= 0) {
+                            continue;
+                        }
+                        $ts    = (int) $timestamps[$i];
+                        $dtObj = \Carbon\Carbon::createFromTimestamp($ts, 'Asia/Jakarta');
+                        $c     = (float) $closes[$i];
+                        $v     = (float) $volumes[$i];
+                        $slot  = $dtObj->format('H:i');
+
+                        $candles[] = [
+                            'date'      => $dtObj->format('Y-m-d'),
+                            'slot'      => $slot,
+                            'last_hhmm' => $slot,
+                            'bucket_ts' => $ts,
+                            'o'         => (float) ($opens[$i] ?? $c),
+                            'h'         => (float) ($highs[$i] ?? $c),
+                            'l'         => (float) ($lows[$i] ?? $c),
+                            'c'         => $c,
+                            'v'         => $v,
+                            'val'       => $c * $v,
+                        ];
+                    }
+
+                    if (count($candles) >= 10) {
+                        $parsedMap[$sym] = [
+                            'source'  => 'Yahoo',
+                            'candles' => $candles,
+                        ];
+                    }
+                }
+            }
+
+            // Cek apakah sudah ada data sesi hari ini (jika ada, abaikan simbol yang masih nyangkut kemarin)
+            $hasLiveToday = false;
+            foreach ($parsedMap as $entry) {
+                $lastC = $entry['candles'][count($entry['candles']) - 1] ?? null;
+                if ($lastC && $lastC['date'] === $todayWib) {
+                    $hasLiveToday = true;
+                    break;
+                }
+            }
+
+            $candidates = [];
+            foreach ($parsedMap as $sym => $entry) {
+                $candles = $entry['candles'];
+                $n       = count($candles);
+                if ($n < 10) {
                     continue;
                 }
 
                 $last = $candles[$n - 1];
-                $prev = $candles[$n - 2];
-
-                $lookback = min(20, $n - 1);
-                $volSlice = array_slice($candles, $n - 1 - $lookback, $lookback);
-                $avgVol = array_sum(array_column($volSlice, 'v')) / $lookback;
-                if ($avgVol <= 0) {
+                if ($hasLiveToday && $last['date'] !== $todayWib) {
                     continue;
                 }
 
-                $volRatio = round($last['v'] / $avgVol, 2);
-                $range = $last['h'] - $last['l'];
-                $clv = $range > 0 ? round((($last['c'] - $last['l']) / $range) * 100, 0) : ($last['c'] > $prev['c'] ? 100 : ($last['c'] < $prev['c'] ? 0 : 50));
+                // Jika candle 15m terbaru baru berjalan < 4 menit, pakai candle 15m hari ini yang baru saja tutup
+                if ($last['date'] === $todayWib && $n >= 11 && $candles[$n - 2]['date'] === $todayWib) {
+                    $ageSec = $nowTs - $last['bucket_ts'];
+                    if ($ageSec >= 0 && $ageSec < 240) {
+                        array_pop($candles);
+                        $n    = count($candles);
+                        $last = $candles[$n - 1];
+                    }
+                }
+                $prev = $candles[$n - 2];
 
-                $candleChg = round((($last['c'] - $prev['c']) / $prev['c']) * 100, 2);
-                $prevDayClose = $meta['chartPreviousClose'] ?? ($meta['previousClose'] ?? $prev['c']);
-                $dayChg = $prevDayClose > 0 ? round((($last['c'] - $prevDayClose) / $prevDayClose) * 100, 2) : $candleChg;
-
-                if ($volRatio >= 2.5 && $clv >= 70 && $candleChg >= 0) {
-                    $tag = '🔥 AGGRESSIVE SWEEP (Haka Kuat)';
-                } elseif ($volRatio >= 1.5 && $candleChg >= 0) {
-                    $tag = '⚡ UNUSUAL VOLUME SPIKE';
-                } elseif ($volRatio >= 1.5 && $candleChg < 0) {
-                    $tag = '⚠️ INTRADAY DISTRIBUTION / FLUSH';
-                } elseif ($candleChg > 0) {
-                    $tag = '📈 INTRADAY ACCUMULATION';
-                } else {
-                    $tag = '👀 ACTIVE CLOSING / FLOW';
+                // 3. Prev Day Close asli (bar terakhir dari tanggal bursa sebelumnya)
+                $prevDayClose = null;
+                for ($i = $n - 2; $i >= 0; $i--) {
+                    if ($candles[$i]['date'] < $last['date']) {
+                        $prevDayClose = $candles[$i]['c'];
+                        break;
+                    }
+                }
+                if (!$prevDayClose || $prevDayClose <= 0) {
+                    $prevDayClose = $prev['c'];
                 }
 
-                $score = ($volRatio * 25) + ($clv * 0.3) + (abs($candleChg) * 5);
+                // 4. Baseline Volume: utamakan rata-rata slot jam yang sama (time-of-day)
+                $sameSlotVols = [];
+                $generalVols  = [];
+                for ($i = 0; $i < $n - 1; $i++) {
+                    $cb = $candles[$i];
+                    if ($cb['slot'] === $last['slot'] && $cb['date'] < $last['date']) {
+                        $sameSlotVols[] = $cb['v'];
+                    }
+                    // Hindari distorsi lelang penutupan 15:45-16:00 pada rata-rata umum
+                    if ($cb['slot'] !== '15:45' && $cb['slot'] !== '16:00') {
+                        $generalVols[] = $cb['v'];
+                    }
+                }
+
+                if (count($sameSlotVols) >= 2) {
+                    $baseVol = array_sum($sameSlotVols) / count($sameSlotVols);
+                } else {
+                    $slice   = array_slice($generalVols, -20);
+                    $baseVol = !empty($slice) ? array_sum($slice) / count($slice) : 0.0;
+                }
+                if ($baseVol <= 0) {
+                    continue;
+                }
+
+                // Pro-rating halus untuk candle 15m yang sedang berjalan hari ini
+                $progress = 1.0;
+                if ($last['date'] === $todayWib) {
+                    $elapsedSec = $nowTs - $last['bucket_ts'];
+                    if ($elapsedSec >= 0 && $elapsedSec < 900) {
+                        $elapsedMin = max(1, (int) floor($elapsedSec / 60) + 1);
+                        $progress   = max(0.35, min(1.0, $elapsedMin / 15.0));
+                    }
+                }
+
+                $volRatio = round($last['v'] / ($baseVol * $progress), 2);
+                $range    = $last['h'] - $last['l'];
+                // Jika High == Low (1 harga / auction), CLV netral 50% (bukan 0%/100% palsu)
+                $clv = $range > 0
+                    ? (int) round((($last['c'] - $last['l']) / $range) * 100)
+                    : 50;
+
+                // Pada candle pertama sesi (09:00), ukur tekanan intraday dari Open agar tidak tercampur gap semalam
+                $isFirstBarOfDay = $last['date'] !== $prev['date'];
+                $ref15m          = $isFirstBarOfDay ? $last['o'] : $prev['c'];
+                $candleChg       = $ref15m > 0 ? round((($last['c'] - $ref15m) / $ref15m) * 100, 2) : 0.0;
+                $dayChg          = $prevDayClose > 0 ? round((($last['c'] - $prevDayClose) / $prevDayClose) * 100, 2) : $candleChg;
+                $valIdr          = (float) $last['val'];
+
+                // Saring noise: wajib ada nilai transaksi minimal Rp 500 Jt & volume aktif
+                if ($valIdr < 500_000_000) {
+                    continue;
+                }
+                if ($volRatio < 1.20 && !($volRatio >= 0.85 && abs($candleChg) >= 1.0 && $valIdr >= 1_000_000_000)) {
+                    continue;
+                }
+
+                if ($volRatio >= 2.0 && $clv >= 70 && $candleChg >= 0.50 && $range > 0 && $valIdr >= 2_000_000_000) {
+                    $tag = '🔥 AGGRESSIVE SWEEP (Haka Kuat)';
+                } elseif ($volRatio >= 1.8 && $clv <= 30 && $candleChg <= -0.50 && $range > 0 && $valIdr >= 2_000_000_000) {
+                    $tag = '⚠️ INTRADAY DISTRIBUTION / FLUSH';
+                } elseif ($volRatio >= 1.6 && $candleChg >= 0.25 && $clv >= 60 && $valIdr >= 1_000_000_000) {
+                    $tag = '⚡ UNUSUAL VOLUME SPIKE';
+                } elseif ($volRatio >= 1.5 && $candleChg <= -0.25 && $clv <= 40 && $valIdr >= 1_000_000_000) {
+                    $tag = '🔻 SELLING PRESSURE';
+                } elseif ($volRatio >= 1.0 && $candleChg >= 0.40 && $clv >= 65 && $valIdr >= 1_000_000_000) {
+                    $tag = '📈 INTRADAY ACCUMULATION';
+                } elseif ($volRatio >= 1.0 && $candleChg <= -0.40 && $clv <= 35 && $valIdr >= 1_000_000_000) {
+                    $tag = '📉 INTRADAY WEAKNESS';
+                } else {
+                    $tag = '👀 HIGH ACTIVITY / CHOPPY';
+                }
+
+                $valBonus = $valIdr >= 10_000_000_000 ? 15 : ($valIdr >= 3_000_000_000 ? 8 : 0);
+                $score    = (min($volRatio, 12) * 20) + (abs($candleChg) * 12) + $valBonus + (abs($clv - 50) * 0.25);
 
                 $candidates[] = [
-                    'symbol' => $sym,
-                    'price' => $last['c'],
+                    'symbol'     => $sym,
+                    'price'      => $last['c'],
                     'candle_chg' => $candleChg,
-                    'day_chg' => $dayChg,
-                    'vol_ratio' => $volRatio,
-                    'clv' => $clv,
-                    'tag' => $tag,
-                    'score' => $score,
+                    'day_chg'    => $dayChg,
+                    'vol_ratio'  => $volRatio,
+                    'clv'        => $clv,
+                    'val_idr'    => $valIdr,
+                    'bar_date'   => $last['date'],
+                    'bar_slot'   => $last['slot'],
+                    'bar_last'   => $last['last_hhmm'],
+                    'is_live'    => $last['date'] === $todayWib,
+                    'source'     => $entry['source'],
+                    'tag'        => $tag,
+                    'score'      => $score,
                 ];
             }
 
@@ -1561,7 +1792,7 @@ class StockScreenerService
             return null;
         }
 
-        return Cache::remember("sb_broker_flow_{$sym}", 180, function () use ($sym, $token) {
+        return Cache::remember("sb_broker_flow_{$sym}_v5", 180, function () use ($sym, $token) {
             $retailBrokers = ['YP', 'XC', 'XL', 'PD', 'KK', 'NI', 'SQ', 'CC', 'GR', 'EP', 'DR', 'LG'];
 
             for ($i = 0; $i <= 3; $i++) {
@@ -1591,10 +1822,12 @@ class StockScreenerService
 
                     if (!$resp->successful()) {
                         if (in_array($resp->status(), [401, 403])) {
+                            Cache::put('sb_token_expired_flag', true, 60);
                             return null;
                         }
                         continue;
                     }
+                    Cache::forget('sb_token_expired_flag');
 
                     $data = $resp->json('data');
                     $brokersBuy  = $data['broker_summary']['brokers_buy'] ?? [];
@@ -1605,17 +1838,53 @@ class StockScreenerService
                         continue;
                     }
 
-                    $retailNet = 0.0;
+                    $netMap = [];
+                    $foreignNet = 0.0;
                     foreach ($brokersBuy as $b) {
-                        if (in_array($b['netbs_broker_code'] ?? '', $retailBrokers)) {
-                            $retailNet += abs((float) ($b['bval'] ?? 0));
+                        $code = strtoupper((string) ($b['netbs_broker_code'] ?? ''));
+                        $val  = abs((float) ($b['bval'] ?? 0));
+                        $type = strtolower((string) ($b['type'] ?? ''));
+                        if ($code !== '') {
+                            $netMap[$code] = ($netMap[$code] ?? 0.0) + $val;
+                        }
+                        if (str_contains($type, 'asing') || str_contains($type, 'foreign')) {
+                            $foreignNet += $val;
                         }
                     }
                     foreach ($brokersSell as $s) {
-                        if (in_array($s['netbs_broker_code'] ?? '', $retailBrokers)) {
-                            $retailNet -= abs((float) ($s['sval'] ?? 0));
+                        $code = strtoupper((string) ($s['netbs_broker_code'] ?? ''));
+                        $val  = abs((float) ($s['sval'] ?? 0));
+                        $type = strtolower((string) ($s['type'] ?? ''));
+                        if ($code !== '') {
+                            $netMap[$code] = ($netMap[$code] ?? 0.0) - $val;
+                        }
+                        if (str_contains($type, 'asing') || str_contains($type, 'foreign')) {
+                            $foreignNet -= $val;
                         }
                     }
+
+                    $r12Brokers   = ['PD', 'OD', 'XC', 'GR', 'EP', 'YP', 'NI', 'DH', 'CP', 'XL', 'KK', 'SQ'];
+                    $retailCapNet = 0.0;
+                    $capVal       = 0.20 * $totalValue;
+                    $minMat       = 0.02 * $totalValue;
+                    $mS = 0; $mB = 0; $aS = 0; $aB = 0;
+                    foreach ($r12Brokers as $rb) {
+                        $nv = $netMap[$rb] ?? 0.0;
+                        $retailCapNet += max(-$capVal, min($capVal, $nv));
+                        if ($nv < 0) {
+                            $aS++;
+                            if (abs($nv) >= $minMat) {
+                                $mS++;
+                            }
+                        } elseif ($nv > 0) {
+                            $aB++;
+                            if ($nv >= $minMat) {
+                                $mB++;
+                            }
+                        }
+                    }
+                    $rSellCnt = ($mS + $mB) > 0 ? $mS : $aS;
+                    $rBuyCnt  = ($mS + $mB) > 0 ? $mB : $aB;
 
                     $topBuyers = array_values(array_filter(array_map(
                         fn($b) => $b['netbs_broker_code'] ?? '',
@@ -1626,28 +1895,139 @@ class StockScreenerService
                         array_slice($brokersSell, 0, 5)
                     )));
 
-                    $retailPct = round((abs($retailNet) / $totalValue) * 100, 1);
-                    $absVal = abs($retailNet);
-                    if ($absVal >= 1_000_000_000) {
-                        $valFmt = 'Rp ' . number_format($absVal / 1_000_000_000, 1, ',', '.') . ' M';
-                    } elseif ($absVal >= 1_000_000) {
-                        $valFmt = 'Rp ' . number_format($absVal / 1_000_000, 0, ',', '.') . ' Jt';
-                    } else {
-                        $valFmt = 'Rp ' . number_format($absVal, 0, ',', '.');
-                    }
+                    $calcTopAvg = static function (array $brokers, int $limit = 3): ?float {
+                        $sumVal = 0.0;
+                        $sumShares = 0.0;
+                        foreach (array_slice($brokers, 0, $limit) as $b) {
+                            $val = abs((float) ($b['bval'] ?? $b['netbs_buy_val'] ?? 0));
+                            $lot = abs((float) ($b['blot'] ?? $b['netbs_buy_lot'] ?? 0));
+                            $avg = (float) ($b['netbs_buy_avg_price'] ?? 0);
+                            if ($avg > 0 && $val > 0) {
+                                $sumVal += $val;
+                                $sumShares += ($val / $avg);
+                            } elseif ($lot > 0 && $val > 0) {
+                                $sumVal += $val;
+                                $sumShares += ($lot * 100);
+                            } elseif ($lot > 0 && $avg > 0) {
+                                $sumVal += ($lot * 100 * $avg);
+                                $sumShares += ($lot * 100);
+                            }
+                        }
+                        return $sumShares > 0 ? round($sumVal / $sumShares, 2) : null;
+                    };
+                    $top3Avg1d = $calcTopAvg($brokersBuy, 3);
+
+                    $fmtIdr = static function (float $v): string {
+                        $abs = abs($v);
+                        if ($abs >= 1_000_000_000) {
+                            return 'Rp ' . number_format($abs / 1_000_000_000, 1, ',', '.') . ' M';
+                        }
+                        if ($abs >= 1_000_000) {
+                            return 'Rp ' . number_format($abs / 1_000_000, 0, ',', '.') . ' Jt';
+                        }
+                        return 'Rp ' . number_format($abs, 0, ',', '.');
+                    };
+
+                    $retailPct = round((abs($retailCapNet) / $totalValue) * 100, 1);
+                    $valFmt    = $fmtIdr($retailCapNet);
+
+                    $foreignSide = abs($foreignNet) < 1_000_000 ? 'Netral' : ($foreignNet > 0 ? 'Net Buy' : 'Net Sell');
+                    $foreignVal  = $foreignSide === 'Netral'
+                        ? 'Netral'
+                        : (($foreignNet > 0 ? '+' : '-') . $fmtIdr($foreignNet));
 
                     $accDistRaw = (string) ($data['bandar_detector']['broker_accdist'] ?? 'Netral');
                     $accDist = trim(str_replace(['_', 'AccDist'], [' ', ''], $accDistRaw)) ?: 'Netral';
 
+                    // Konteks 5 Hari Bursa (Acc/Dist + Ritel R12 Cap ±20%)
+                    $accDist5d      = null;
+                    $retailSide5d   = null;
+                    $retailPct5d    = null;
+                    $isRetSell5d    = null;
+                    $top3Avg5d      = null;
+                    try {
+                        $c5 = $candidate->copy();
+                        $wd = 1;
+                        while ($wd < 5) {
+                            $c5->subDay();
+                            if (!$c5->isWeekend()) {
+                                $wd++;
+                            }
+                        }
+                        $resp5 = Http::withToken($token)
+                            ->withOptions(['force_ip_resolve' => 'v4'])
+                            ->withHeaders([
+                                'Origin'     => 'https://stockbit.com',
+                                'Referer'    => 'https://stockbit.com/',
+                                'User-Agent' => 'Mozilla/5.0',
+                            ])
+                            ->connectTimeout(3)
+                            ->timeout(4)
+                            ->get("https://exodus.stockbit.com/marketdetectors/{$sym}", [
+                                'from'             => $c5->format('Y-m-d'),
+                                'to'               => $dStr,
+                                'transaction_type' => 'TRANSACTION_TYPE_NET',
+                                'market_board'     => 'MARKET_BOARD_REGULER',
+                                'investor_type'    => 'INVESTOR_TYPE_ALL',
+                            ]);
+
+                        if ($resp5->successful()) {
+                            $d5     = $resp5->json('data');
+                            $b5Buy  = $d5['broker_summary']['brokers_buy'] ?? [];
+                            $b5Sell = $d5['broker_summary']['brokers_sell'] ?? [];
+                            $t5Val  = (float) ($d5['bandar_detector']['value'] ?? $d5['bandar_detector']['total_value'] ?? 0);
+
+                            if ($t5Val > 0 && (!empty($b5Buy) || !empty($b5Sell))) {
+                                $nm5 = [];
+                                foreach ($b5Buy as $b) {
+                                    $cd = strtoupper((string) ($b['netbs_broker_code'] ?? ''));
+                                    if ($cd !== '') {
+                                        $nm5[$cd] = ($nm5[$cd] ?? 0.0) + abs((float) ($b['bval'] ?? 0));
+                                    }
+                                }
+                                foreach ($b5Sell as $s) {
+                                    $cd = strtoupper((string) ($s['netbs_broker_code'] ?? ''));
+                                    if ($cd !== '') {
+                                        $nm5[$cd] = ($nm5[$cd] ?? 0.0) - abs((float) ($s['sval'] ?? 0));
+                                    }
+                                }
+                                $cap5 = 0.20 * $t5Val;
+                                $r5Net = 0.0;
+                                foreach ($r12Brokers as $rb) {
+                                    $nv5 = $nm5[$rb] ?? 0.0;
+                                    $r5Net += max(-$cap5, min($cap5, $nv5));
+                                }
+                                $ad5Raw       = (string) ($d5['bandar_detector']['broker_accdist'] ?? 'Netral');
+                                $accDist5d    = trim(str_replace(['_', 'AccDist'], [' ', ''], $ad5Raw)) ?: 'Netral';
+                                $retailPct5d  = round((abs($r5Net) / $t5Val) * 100, 1);
+                                $retailSide5d = $r5Net < 0 ? 'Sell' : ($r5Net > 0 ? 'Buy' : 'Netral');
+                                $isRetSell5d  = $r5Net < 0;
+                                $top3Avg5d    = $calcTopAvg($b5Buy, 3);
+                            }
+                        }
+                    } catch (\Throwable $e) {
+                        // Opsional: abaikan jika timeout 5D agar 1D tetap tampil
+                    }
+
                     return [
-                        'date_label'  => $candidate->format('d M'),
-                        'accdist'     => $accDist,
-                        'retail_side' => $retailNet < 0 ? 'Net Sell' : ($retailNet > 0 ? 'Net Buy' : 'Netral'),
-                        'retail_pct'  => $retailPct,
-                        'retail_val'  => $valFmt,
-                        'is_retail_selling' => $retailNet < 0,
-                        'top_buyers'  => $topBuyers,
-                        'top_sellers' => $topSellers,
+                        'date_label'           => $candidate->format('d M'),
+                        'accdist'              => $accDist,
+                        'accdist_5d'           => $accDist5d,
+                        'retail_side'          => $retailCapNet < 0 ? 'Net Sell' : ($retailCapNet > 0 ? 'Net Buy' : 'Netral'),
+                        'retail_pct'           => $retailPct,
+                        'retail_val'           => $valFmt,
+                        'retail_sb'            => "{$rSellCnt}S/{$rBuyCnt}B",
+                        'is_retail_selling'    => $retailCapNet < 0,
+                        'retail_side_5d'       => $retailSide5d,
+                        'retail_pct_5d'        => $retailPct5d,
+                        'is_retail_selling_5d' => $isRetSell5d,
+                        'foreign_net'          => $foreignNet,
+                        'foreign_side'         => $foreignSide,
+                        'foreign_val'          => $foreignVal,
+                        'top_buyers'           => $topBuyers,
+                        'top_sellers'          => $topSellers,
+                        'top3_avg_1d'          => $top3Avg1d,
+                        'top3_avg_5d'          => $top3Avg5d,
                     ];
                 } catch (\Throwable $e) {
                     continue;
@@ -1659,7 +2039,7 @@ class StockScreenerService
     }
 
 
-    public function screenKronosUpside(float $minProb = 80.0, int $maxTickers = 28): array
+    public function screenKronosUpside(float $minProb = 80.0, int $maxTickers = 100): array
     {
         $analysisSvc = app(StockAnalysisService::class);
         $tickers = array_slice($this->watchlist, 0, $maxTickers);
@@ -1712,7 +2092,7 @@ class StockScreenerService
         ];
     }
 
-    public function getBrokerSummary(string $rawSymbol, string $fromDate, string $toDate): array
+    public function getBrokerSummary(string $rawSymbol, string $fromDate, string $toDate, string $investorType = 'ALL'): array
     {
         $sym = preg_replace('/JK$/', '', strtoupper(trim(preg_replace('/[^A-Za-z0-9]/', '', $rawSymbol))));
         if (strlen($sym) < 4) {
@@ -1723,6 +2103,18 @@ class StockScreenerService
         if (empty($token)) {
             return ['error' => 'NO_TOKEN'];
         }
+
+        $invNorm = strtoupper(trim($investorType));
+        $invKey = match ($invNorm) {
+            'FOR', 'FOREIGN', 'INVESTOR_TYPE_FOREIGN' => 'FOR',
+            'DOM', 'DOMESTIC', 'INVESTOR_TYPE_DOMESTIC' => 'DOM',
+            default => 'ALL',
+        };
+        $apiInvestorType = match ($invKey) {
+            'FOR' => 'INVESTOR_TYPE_FOREIGN',
+            'DOM' => 'INVESTOR_TYPE_DOMESTIC',
+            default => 'INVESTOR_TYPE_ALL',
+        };
 
         $effectiveFrom = $fromDate;
         $effectiveTo   = $toDate;
@@ -1737,8 +2129,8 @@ class StockScreenerService
             $effectiveTo   = $effectiveFrom;
         }
 
-        $cacheKey = "sb_brokersum_range_v2_{$sym}_{$effectiveFrom}_{$effectiveTo}";
-        return \Illuminate\Support\Facades\Cache::remember($cacheKey, 180, function () use ($sym, $token, $effectiveFrom, $effectiveTo) {
+        $cacheKey = "sb_brokersum_range_v3_{$sym}_{$effectiveFrom}_{$effectiveTo}_{$invKey}";
+        return \Illuminate\Support\Facades\Cache::remember($cacheKey, 180, function () use ($sym, $token, $effectiveFrom, $effectiveTo, $invKey, $apiInvestorType) {
             try {
                 $resp = \Illuminate\Support\Facades\Http::withToken($token)
                     ->withOptions(['force_ip_resolve' => 'v4'])
@@ -1754,7 +2146,7 @@ class StockScreenerService
                         'to'               => $effectiveTo,
                         'transaction_type' => 'TRANSACTION_TYPE_NET',
                         'market_board'     => 'MARKET_BOARD_REGULER',
-                        'investor_type'    => 'INVESTOR_TYPE_ALL',
+                        'investor_type'    => $apiInvestorType,
                     ]);
 
                 if (!$resp->successful()) {
@@ -1764,23 +2156,53 @@ class StockScreenerService
                     return ['error' => 'HTTP_ERROR', 'status' => $resp->status()];
                 }
 
-                $json = $resp->json();
-                $data = $json['data'] ?? [];
-                $bs   = $data['broker_summary'] ?? [];
+                $json   = $resp->json();
+                $data   = $json['data'] ?? [];
+                $bs     = $data['broker_summary'] ?? [];
                 $bandar = $data['bandar_detector'] ?? [];
 
                 $rawBuy  = $bs['brokers_buy'] ?? [];
                 $rawSell = $bs['brokers_sell'] ?? [];
 
+                $govCodes     = ['CC', 'NI', 'OD', 'DX'];
+                $foreignCodes = ['AK', 'BK', 'KZ', 'ZP', 'YU', 'RX', 'YP', 'TP', 'AG', 'CS', 'MS', 'ML', 'CG', 'DB', 'UB', 'DP', 'GW', 'FS', 'AI', 'DR', 'HD', 'KK', 'LH', 'LS'];
+
+                $resolveTag = static function (string $code, ?string $rawType) use ($govCodes, $foreignCodes): string {
+                    $t = strtolower(trim((string) $rawType));
+                    if (str_contains($t, 'asing') || str_contains($t, 'foreign')) {
+                        return 'F';
+                    }
+                    if (str_contains($t, 'pemerintah') || str_contains($t, 'bumn') || str_contains($t, 'gov')) {
+                        return 'G';
+                    }
+                    if (str_contains($t, 'lokal') || str_contains($t, 'local') || str_contains($t, 'dom')) {
+                        return 'L';
+                    }
+                    $c = strtoupper(trim($code));
+                    if (in_array($c, $govCodes, true)) {
+                        return 'G';
+                    }
+                    if (in_array($c, $foreignCodes, true)) {
+                        return 'F';
+                    }
+                    return 'L';
+                };
+
                 $topBuy = [];
                 $netBuySum = 0.0;
-                foreach (array_slice($rawBuy, 0, 5) as $idx => $b) {
-                    $val = (float) ($b['bval'] ?? $b['netbs_buy_val'] ?? 0);
-                    $lot = (float) ($b['blot'] ?? $b['netbs_buy_lot'] ?? 0);
-                    $avg = (float) ($b['netbs_buy_avg_price'] ?? ($lot > 0 ? $val / ($lot * 100) : 0));
+                $buyLotSum = 0.0;
+                $buyWeightedPriceSum = 0.0;
+                foreach (array_slice($rawBuy, 0, 5) as $b) {
+                    $code = (string) ($b['netbs_broker_code'] ?? '-');
+                    $val  = (float) ($b['bval'] ?? $b['netbs_buy_val'] ?? 0);
+                    $lot  = (float) ($b['blot'] ?? $b['netbs_buy_lot'] ?? 0);
+                    $avg  = (float) ($b['netbs_buy_avg_price'] ?? ($lot > 0 ? $val / ($lot * 100) : 0));
                     $netBuySum += $val;
+                    $buyLotSum += $lot;
+                    $buyWeightedPriceSum += ($lot * $avg);
                     $topBuy[] = [
-                        'code' => $b['netbs_broker_code'] ?? '-',
+                        'code' => $code,
+                        'tag'  => $resolveTag($code, $b['type'] ?? null),
                         'val'  => $val,
                         'lot'  => $lot,
                         'avg'  => $avg,
@@ -1789,13 +2211,19 @@ class StockScreenerService
 
                 $topSell = [];
                 $netSellSum = 0.0;
-                foreach (array_slice($rawSell, 0, 5) as $idx => $s) {
-                    $val = abs((float) ($s['sval'] ?? $s['netbs_sell_val'] ?? 0));
-                    $lot = abs((float) ($s['slot'] ?? $s['netbs_sell_lot'] ?? 0));
-                    $avg = (float) ($s['netbs_sell_avg_price'] ?? ($lot > 0 ? $val / ($lot * 100) : 0));
+                $sellLotSum = 0.0;
+                $sellWeightedPriceSum = 0.0;
+                foreach (array_slice($rawSell, 0, 5) as $s) {
+                    $code = (string) ($s['netbs_broker_code'] ?? '-');
+                    $val  = abs((float) ($s['sval'] ?? $s['netbs_sell_val'] ?? 0));
+                    $lot  = abs((float) ($s['slot'] ?? $s['netbs_sell_lot'] ?? 0));
+                    $avg  = (float) ($s['netbs_sell_avg_price'] ?? ($lot > 0 ? $val / ($lot * 100) : 0));
                     $netSellSum += $val;
+                    $sellLotSum += $lot;
+                    $sellWeightedPriceSum += ($lot * $avg);
                     $topSell[] = [
-                        'code' => $s['netbs_broker_code'] ?? '-',
+                        'code' => $code,
+                        'tag'  => $resolveTag($code, $s['type'] ?? null),
                         'val'  => $val,
                         'lot'  => $lot,
                         'avg'  => $avg,
@@ -1803,16 +2231,19 @@ class StockScreenerService
                 }
 
                 return [
-                    'symbol'       => $sym,
-                    'from'         => $effectiveFrom,
-                    'to'           => $effectiveTo,
-                    'status'       => $bandar['avg']['accdist'] ?? $bandar['broker_accdist'] ?? 'Netral',
-                    'buyer_count'  => (int) ($bandar['total_buyer'] ?? count($rawBuy)),
-                    'seller_count' => (int) ($bandar['total_seller'] ?? count($rawSell)),
-                    'net_top5'     => $netBuySum - $netSellSum,
-                    'top_buy'      => $topBuy,
-                    'top_sell'     => $topSell,
-                    'bandar'       => [
+                    'symbol'        => $sym,
+                    'from'          => $effectiveFrom,
+                    'to'            => $effectiveTo,
+                    'investor_type' => $invKey,
+                    'status'        => $bandar['avg']['accdist'] ?? $bandar['broker_accdist'] ?? 'Neutral',
+                    'buyer_count'   => (int) ($bandar['total_buyer'] ?? count($rawBuy)),
+                    'seller_count'  => (int) ($bandar['total_seller'] ?? count($rawSell)),
+                    'net_top5'      => $netBuySum - $netSellSum,
+                    'avg_buy_top5'  => $buyLotSum > 0 ? ($buyWeightedPriceSum / $buyLotSum) : 0.0,
+                    'avg_sell_top5' => $sellLotSum > 0 ? ($sellWeightedPriceSum / $sellLotSum) : 0.0,
+                    'top_buy'       => $topBuy,
+                    'top_sell'      => $topSell,
+                    'bandar'        => [
                         'top1'           => $bandar['top1'] ?? null,
                         'top3'           => $bandar['top3'] ?? null,
                         'top5'           => $bandar['top5'] ?? null,
@@ -1828,5 +2259,322 @@ class StockScreenerService
                 return ['error' => 'EXCEPTION', 'status' => $e->getMessage()];
             }
         });
+    }
+
+    /**
+     * Screener Non-Retail Flow berbasis 12 broker ritel murni (R12) + konsensus S/B.
+     */
+
+    /**
+     * Screener Non-Retail Flow berbasis 12 broker ritel murni (R12) + konsensus S/B.
+     */
+    public function scanNonRetailFlow(string $fromDate, string $toDate, float $minValM = 0.5, int $limit = 20, bool $forceRefresh = false): array
+    {
+        $token = $this->getStockbitToken();
+        if (empty($token)) {
+            return ['error' => 'NO_TOKEN'];
+        }
+
+        $effectiveFrom = $fromDate;
+        $effectiveTo   = $toDate;
+
+        $toDt = \Carbon\Carbon::parse($toDate, 'Asia/Jakarta');
+        while ($toDt->isWeekend()) {
+            $toDt->subDay();
+        }
+        $effectiveTo = $toDt->format('Y-m-d');
+
+        // Untuk mode 1D, probe BBRI agar otomatis mundur jika tanggal yg dipilih adalah libur bursa
+        if ($fromDate === $toDate) {
+            $probeDt = $toDt->copy();
+            for ($try = 0; $try < 5; $try++) {
+                while ($probeDt->isWeekend()) {
+                    $probeDt->subDay();
+                }
+                $dStr = $probeDt->format('Y-m-d');
+                try {
+                    $pResp = \Illuminate\Support\Facades\Http::withToken($token)
+                        ->withOptions(['force_ip_resolve' => 'v4'])
+                        ->withHeaders([
+                            'Origin'     => 'https://stockbit.com',
+                            'Referer'    => 'https://stockbit.com/',
+                            'User-Agent' => 'Mozilla/5.0',
+                        ])
+                        ->connectTimeout(4)
+                        ->timeout(6)
+                        ->get('https://exodus.stockbit.com/marketdetectors/BBRI', [
+                            'from'             => $dStr,
+                            'to'               => $dStr,
+                            'transaction_type' => 'TRANSACTION_TYPE_NET',
+                            'market_board'     => 'MARKET_BOARD_REGULER',
+                            'investor_type'    => 'INVESTOR_TYPE_ALL',
+                        ]);
+
+                    if (in_array($pResp->status(), [401, 403], true)) {
+                        return ['error' => 'TOKEN_EXPIRED'];
+                    }
+                    if ($pResp->successful()) {
+                        $pBs = $pResp->json()['data']['broker_summary'] ?? [];
+                        if (!empty($pBs['brokers_buy']) || !empty($pBs['brokers_sell'])) {
+                            $effectiveFrom = $dStr;
+                            $effectiveTo   = $dStr;
+                            break;
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    // lanjut mundur 1 hari jika probe gagal
+                }
+                $probeDt->subDay();
+            }
+            if ($effectiveFrom !== $effectiveTo) {
+                $effectiveFrom = $effectiveTo;
+            }
+        }
+
+        $universe = array_values(array_unique([
+            // Perbankan & Finansial
+            'BBCA', 'BBRI', 'BMRI', 'BBNI', 'BBTN', 'BRIS', 'BNGA', 'BDMN', 'ARTO', 'BBYB', 'PNLF', 'PNBN', 'TUGU',
+            // Telko, Teknologi & Media
+            'TLKM', 'ISAT', 'EXCL', 'TOWR', 'TBIG', 'MTEL', 'GOTO', 'BUKA', 'WIFI', 'DATA', 'SCMA', 'EMTK', 'BMTR', 'FILM',
+            // Konsumer, Ritel & Kesehatan
+            'ICBP', 'INDF', 'MYOR', 'CMRY', 'UNVR', 'AMRT', 'ACES', 'MAPI', 'MAPA', 'ERAA', 'ERAL', 'GGRM', 'HMSP', 'VICI',
+            'SIDO', 'KLBF', 'MIKA', 'HEAL', 'SILO', 'TSPC', 'PYFA', 'KDTN',
+            // Energi, Batubara & Migas
+            'ADRO', 'AADI', 'ADMR', 'PTBA', 'ITMG', 'INDY', 'HRUM', 'BUMI', 'BSSR', 'ABMM', 'BYAN', 'GEMS', 'PTRO',
+            'MEDC', 'ELSA', 'PGAS', 'AKRA', 'ENRG', 'RAJA', 'RATU', 'PGEO',
+            // Metal, Mineral & Kimia
+            'ANTM', 'INCO', 'MDKA', 'MBMA', 'NCKL', 'TINS', 'BRMS', 'AMMN', 'DKFT',
+            'BRPT', 'TPIA', 'BREN', 'CUAN', 'TKIM', 'INKP', 'ISSP', 'ASPR',
+            // Otomotif, Semen, Poultry & CPO
+            'ASII', 'UNTR', 'AUTO', 'VKTR', 'SMGR', 'INTP', 'CPIN', 'JPFA', 'DSNG', 'LSIP', 'SMAR', 'SSMS',
+            // Properti, Konstruksi & Logistik
+            'CTRA', 'BSDE', 'PWON', 'SMRA', 'PANI', 'DMAS', 'KPIG', 'RISE', 'JSMR', 'ASSA', 'BULL', 'SMDR', 'NRCA',
+            // Mid/Small Caps Aktif
+            'DAAZ', 'BAIK', 'IDEA', 'RLCO', 'UANG', 'MGLV', 'EKAD', 'PADI', 'SUPA', 'JECX', 'BAJA', 'NSSS',
+            // Tambahan Universe Historis Non-Retail Flow
+            'AALI', 'ADES', 'ADMF', 'AGII', 'AGRO', 'AHAP', 'AIMS', 'ALII', 'AMAN', 'APEX', 'APIC', 'APLN', 'ARCI', 'ARII', 'ARKO', 'ASGR',
+            'ASLI', 'ASMI', 'ASPI', 'ASRI', 'ATAP', 'AVIA', 'AYAM', 'AYLS', 'BABP', 'BACH', 'BANK', 'BAPA', 'BBKP', 'BEEF', 'BELI', 'BEST',
+            'BFIN', 'BGTG', 'BIPI', 'BIPP', 'BIRD', 'BJBR', 'BJTM', 'BKSL', 'BLUE', 'BMHS', 'BNBA', 'BNBR', 'BOAT', 'BTPS', 'BUVA', 'BWPT',
+            'CARS', 'CASH', 'CBDK', 'CBRE', 'CDIA', 'CENT', 'CGAS', 'CITA', 'CITY', 'CNMA', 'COCO', 'COIN', 'CPRO', 'CSRA', 'CTTH', 'DADA',
+            'DEWA', 'DGIK', 'DGNS', 'DKHH', 'DNAR', 'DPUM', 'DRMA', 'DSFI', 'DSSA', 'DWGL', 'ELIT', 'ELPI', 'ELTY', 'EMAS', 'EMMI', 'ENZO',
+            'ESSA', 'ESTA', 'FAST', 'FIRE', 'FITT', 'FOLK', 'FORE', 'FORU', 'FPNI', 'GJTL', 'GPSO', 'GRIA', 'GRPM', 'GSMF', 'GTRA', 'GULA',
+            'GZCO', 'HELI', 'HOPE', 'HRTA', 'HUMI', 'IFSH', 'IMJS', 'IMPC', 'INDX', 'INET', 'INOV', 'INPC', 'IPCC', 'IPCM', 'IRSX', 'ISEA',
+            'ITIC', 'JARR', 'JAST', 'JAWA', 'JAYA', 'JELI', 'JIHD', 'JMAS', 'KAEF', 'KBLV', 'KEEN', 'KETR', 'KIJA', 'KKGI', 'KOBX', 'KOCI',
+            'KOKA', 'KRAS', 'LAJU', 'LAND', 'LAPD', 'LEAD', 'LIVE', 'LPKR', 'LPPF', 'LUCY', 'MAIN', 'MBSS', 'MBTO', 'MCOR', 'MEDS', 'MEJA',
+            'MIDI', 'MINA', 'MITI', 'MLBI', 'MLPL', 'MLPT', 'MNCN', 'MOLI', 'MORA', 'MOTA', 'MPIX', 'MPMX', 'MPOW', 'MPXL', 'MRAT', 'MSIE',
+            'MSIN', 'MSTI', 'MTDL', 'MUTU', 'NANO', 'NASI', 'NATO', 'NAYZ', 'NELY', 'NICE', 'NIKL', 'NINE', 'NISP', 'NOBU', 'NTBK', 'OASA',
+            'OILS', 'PACK', 'PART', 'PBSA', 'PEGE', 'PGUN', 'PIPA', 'PKPK', 'POLA', 'POLU', 'POWR', 'PPRI', 'PPRE', 'PRDA', 'PRDL', 'PRIM',
+            'PSKT', 'PTPS', 'PUDP', 'RALS', 'RANS', 'RBMS', 'REAL', 'RMKO', 'RODA', 'SAME', 'SIMP', 'SINI', 'SLIS', 'SMBR', 'SMGA', 'SMMT',
+            'SMSM', 'SOCI', 'SOFA', 'SOHO', 'SOTS', 'SRTG', 'SSIA', 'STRK', 'SWID', 'TAMA', 'TAPG', 'TCPI', 'TEBE', 'TFAS', 'TMAS', 'TMPO',
+            'TOBA', 'TOTL', 'TPMA', 'TRIM', 'TRIN', 'TRON', 'TRUE', 'TRUK', 'UDNG', 'ULTJ', 'UVCR', 'VERN', 'VISI', 'WEHA', 'WIIM', 'WINR',
+            'WINS', 'WIRG', 'WITM', 'WOWS',
+        ]));
+
+        $r12 = ['PD', 'OD', 'XC', 'GR', 'EP', 'YP', 'NI', 'DH', 'CP', 'XL', 'KK', 'SQ'];
+
+        // Cache key v3 (Cap 20%/broker + S/B >=2% + smoothing sampel kecil min 5 broker)
+        $cacheKey = "sb_nonritel_raw_v5_{$effectiveFrom}_{$effectiveTo}";
+        if ($forceRefresh) {
+            \Illuminate\Support\Facades\Cache::forget($cacheKey);
+        }
+
+        $rawScan = \Illuminate\Support\Facades\Cache::get($cacheKey);
+        if (!is_array($rawScan)) {
+            $allItems     = [];
+            $tokenExpired = false;
+            $rateLimited  = false;
+
+            foreach (array_chunk($universe, 8) as $chunk) {
+                $responses = \Illuminate\Support\Facades\Http::pool(function (\Illuminate\Http\Client\Pool $pool) use ($chunk, $token, $effectiveFrom, $effectiveTo) {
+                    $reqs = [];
+                    foreach ($chunk as $sym) {
+                        $reqs[] = $pool->as($sym)
+                            ->withToken($token)
+                            ->withOptions(['force_ip_resolve' => 'v4'])
+                            ->withHeaders([
+                                'Origin'     => 'https://stockbit.com',
+                                'Referer'    => 'https://stockbit.com/',
+                                'User-Agent' => 'Mozilla/5.0',
+                            ])
+                            ->connectTimeout(4)
+                            ->timeout(8)
+                            ->get("https://exodus.stockbit.com/marketdetectors/{$sym}", [
+                                'from'             => $effectiveFrom,
+                                'to'               => $effectiveTo,
+                                'transaction_type' => 'TRANSACTION_TYPE_NET',
+                                'market_board'     => 'MARKET_BOARD_REGULER',
+                                'investor_type'    => 'INVESTOR_TYPE_ALL',
+                            ]);
+                    }
+                    return $reqs;
+                });
+
+                foreach ($chunk as $sym) {
+                    $resp = $responses[$sym] ?? null;
+                    if (!($resp instanceof \Illuminate\Http\Client\Response)) {
+                        continue;
+                    }
+                    if (in_array($resp->status(), [401, 403], true)) {
+                        $tokenExpired = true;
+                        break 2;
+                    }
+                    if ($resp->status() === 429) {
+                        $rateLimited = true;
+                        break 2;
+                    }
+                    if (!$resp->successful()) {
+                        continue;
+                    }
+
+                    $data    = $resp->json()['data'] ?? [];
+                    $bs      = $data['broker_summary'] ?? [];
+                    $bandar  = $data['bandar_detector'] ?? [];
+                    $rawBuy  = $bs['brokers_buy'] ?? [];
+                    $rawSell = $bs['brokers_sell'] ?? [];
+
+                    if (empty($rawBuy) && empty($rawSell)) {
+                        continue;
+                    }
+
+                    $netMap  = [];
+                    $sumBuy  = 0.0;
+                    $sumSell = 0.0;
+
+                    foreach ($rawBuy as $b) {
+                        $c = strtoupper((string) ($b['netbs_broker_code'] ?? ''));
+                        $v = (float) ($b['bval'] ?? $b['netbs_buy_val'] ?? 0);
+                        if ($c !== '') {
+                            $netMap[$c] = ($netMap[$c] ?? 0.0) + $v;
+                            $sumBuy += $v;
+                        }
+                    }
+                    foreach ($rawSell as $s) {
+                        $c = strtoupper((string) ($s['netbs_broker_code'] ?? ''));
+                        $v = abs((float) ($s['sval'] ?? $s['netbs_sell_val'] ?? 0));
+                        if ($c !== '') {
+                            $netMap[$c] = ($netMap[$c] ?? 0.0) - $v;
+                            $sumSell += $v;
+                        }
+                    }
+
+                    $totalVal = (float) ($bandar['value'] ?? max($sumBuy, $sumSell));
+                    if ($totalVal <= 0) {
+                        $totalVal = max($sumBuy, $sumSell);
+                    }
+                    if ($totalVal <= 0) {
+                        continue;
+                    }
+
+                    $capVal = 0.20 * $totalVal; // Cap simetris ±20% per broker (buy & sell)
+                    $minMatVal  = 0.02 * $totalVal; // Abaikan transaksi noise <2% untuk rasio S/B
+
+                    $rRawNet    = 0.0;
+                    $rCapNet    = 0.0;
+                    $matSellCnt = 0;
+                    $matBuyCnt  = 0;
+                    $allSellCnt = 0;
+                    $allBuyCnt  = 0;
+
+                    foreach ($r12 as $code) {
+                        $nv = $netMap[$code] ?? 0.0;
+                        $rRawNet += $nv;
+                        $rCapNet += max(-$capVal, min($capVal, $nv));
+
+                        if ($nv < 0) {
+                            $allSellCnt++;
+                            if (abs($nv) >= $minMatVal) {
+                                $matSellCnt++;
+                            }
+                        } elseif ($nv > 0) {
+                            $allBuyCnt++;
+                            if ($nv >= $minMatVal) {
+                                $matBuyCnt++;
+                            }
+                        }
+                    }
+
+                    $rSellCnt = ($matSellCnt + $matBuyCnt) > 0 ? $matSellCnt : $allSellCnt;
+                    $rBuyCnt  = ($matSellCnt + $matBuyCnt) > 0 ? $matBuyCnt  : $allBuyCnt;
+                    $active   = $rSellCnt + $rBuyCnt;
+
+                    $rRawPct = (-$rRawNet / $totalVal) * 100.0;
+                    $rCapPct = (-$rCapNet / $totalVal) * 100.0;
+
+                    // Smoothing sampel kecil: penyebut minimal 5 broker agar 2S/0B tidak setara 7S/0B
+                    $netRatio      = ($rSellCnt - $rBuyCnt) / max(5, $active); // -1.0 .. +1.0
+                    $breadthSmooth = (0.5 + 0.5 * $netRatio) * 100.0;           // 0 .. 100
+
+                    // Bobot 75% rasio nilai (ter-cap) + 25% konsensus broker material (smoothed)
+                    $score    = (0.75 * $rCapPct) + (0.25 * $netRatio * 100.0);
+                    $bdAvgPct = (float) ($bandar['avg']['percent'] ?? 0);
+
+                    $allItems[] = [
+                        'symbol'     => $sym,
+                        'val'        => $totalVal,
+                        'r_pct'      => $rCapPct,
+                        'r_raw_pct'  => $rRawPct,
+                        'r_sell'     => $rSellCnt,
+                        'r_buy'      => $rBuyCnt,
+                        'breadth'    => $breadthSmooth,
+                        'score'      => $score,
+                        'bd_avg_pct' => $bdAvgPct,
+                        'bd_status'  => (string) ($bandar['avg']['accdist'] ?? 'Neutral'),
+                    ];
+                }
+
+                usleep(180000);
+            }
+
+            if ($tokenExpired) {
+                return ['error' => 'TOKEN_EXPIRED'];
+            }
+
+            $rawScan = [
+                'scanned'      => count($allItems),
+                'universe'     => count($universe),
+                'rate_limited' => $rateLimited,
+                'items'        => $allItems,
+            ];
+
+            if (!empty($allItems) && !$rateLimited) {
+                \Illuminate\Support\Facades\Cache::put($cacheKey, $rawScan, 600);
+            }
+        }
+
+        $minValRp = max(0.0, $minValM) * 1e9;
+        $filtered = [];
+
+        foreach ($rawScan['items'] as $item) {
+            if ($item['val'] < $minValRp) {
+                continue;
+            }
+            $passes = ($item['r_pct'] >= 10.0 && $item['score'] >= 12.0)
+                || ($item['r_pct'] >= 6.0 && $item['breadth'] >= 65.0 && $item['bd_avg_pct'] > 0);
+            if (!$passes) {
+                continue;
+            }
+
+            if ($item['r_pct'] >= 35.0 && $item['breadth'] >= 70.0) {
+                $item['tier'] = '🔥';
+            } elseif ($item['r_pct'] >= 18.0) {
+                $item['tier'] = '🟢';
+            } else {
+                $item['tier'] = '🟡';
+            }
+            $filtered[] = $item;
+        }
+
+        usort($filtered, static fn($a, $b) => ($b['score'] <=> $a['score']) ?: ($b['r_pct'] <=> $a['r_pct']));
+
+        return [
+            'from'         => $effectiveFrom,
+            'to'           => $effectiveTo,
+            'min_val_m'    => $minValM,
+            'scanned'      => $rawScan['scanned'],
+            'universe'     => $rawScan['universe'],
+            'matched'      => count($filtered),
+            'rate_limited' => $rawScan['rate_limited'],
+            'items'        => array_slice($filtered, 0, $limit),
+        ];
     }
 }

@@ -9,7 +9,7 @@ use Exception;
 
 class StockAnalysisService
 {
-    public function analyze(string $ticker, float $maxRiskRp = 1000000, string $timeframe = '1D', ?float $maxCapitalRp = null): array
+    public function analyze(string $ticker, float $maxRiskRp = 1000000, string $timeframe = '1D', ?float $maxCapitalRp = null, ?bool $hasEarlyAcc = null, ?float $bandarAvg = null): array
     {
         $symbol = strtoupper(trim($ticker));
         if (strlen($symbol) === 4 && ctype_alpha($symbol)) {
@@ -188,10 +188,43 @@ class StockAnalysisService
         $s2 = $isIdx ? $this->roundToIdxTick($s1 * 0.965, 'floor') : round($s1 * 0.965, 2);
         $s3 = $isIdx ? $this->roundToIdxTick($s1 * 0.93, 'floor') : round($s1 * 0.93, 2);
 
-        // Stoploss 1-2 tick di bawah S1 agar tidak mudah tersentuh false breakdown
-        $stoploss = $isIdx ? $this->stepIdxTick($s1, -2) : round($s1 * 0.99, 2);
+        // Hitung ATR(14) dari histori OHLC untuk Stoploss adaptif & indikator volatilitas
+        $atr14  = 0.0;
+        $atrPct = 0.0;
+        if (isset($chartCandles) && is_array($chartCandles) && count($chartCandles) >= 2) {
+            $atrSlice = array_slice(array_values($chartCandles), -15);
+            $trSum = 0.0;
+            $trCnt = 0;
+            for ($i = 1; $i < count($atrSlice); $i++) {
+                $curH = (float) ($atrSlice[$i]['h'] ?? 0);
+                $curL = (float) ($atrSlice[$i]['l'] ?? 0);
+                $prvC = (float) ($atrSlice[$i - 1]['c'] ?? 0);
+                if ($curH > 0 && $curL > 0 && $prvC > 0) {
+                    $trSum += max($curH - $curL, abs($curH - $prvC), abs($curL - $prvC));
+                    $trCnt++;
+                }
+            }
+            if ($trCnt > 0) {
+                $atr14  = round($trSum / $trCnt, $isIdx ? 1 : 2);
+                $atrPct = $lastClose > 0 ? round(($atr14 / $lastClose) * 100, 2) : 0.0;
+            }
+        }
+
+        // Stoploss adaptif berbasis ATR(14): max(1.8% S1, 0.6x ATR14), dibatasi maks 4.5% S1 & min 2 tick BEI
+        $slBufRaw    = max($s1 * 0.018, 0.6 * $atr14);
+        $slBufCap    = min($slBufRaw, $s1 * 0.045);
+        $rawSlTarget = max(1, $s1 - $slBufCap);
+        if ($isIdx) {
+            $slByAtr  = $this->roundToIdxTick($rawSlTarget, 'floor');
+            $slByTick = $this->stepIdxTick($s1, -2);
+            $stoploss = ($slByAtr > 0) ? min($slByAtr, $slByTick) : $slByTick;
+        } else {
+            $stoploss = round($rawSlTarget, 2);
+        }
         if ($stoploss >= $lastClose) {
-            $stoploss = $isIdx ? $this->stepIdxTick($lastClose, -3) : round($lastClose * 0.97, 2);
+            $stoploss = $isIdx
+                ? min($this->roundToIdxTick($lastClose * 0.98, 'floor'), $this->stepIdxTick($lastClose, -3))
+                : round($lastClose * 0.97, 2);
         }
 
         // Money Management berdasarkan Max Risk yang ditentukan (+ opsional Capital Cap)
@@ -221,16 +254,103 @@ class StockAnalysisService
             $signalStatus = "Uptrend (Above MA20 & MA50)";
         } elseif ($lastClose < $lastMa20 && $lastClose < $lastMa50) {
             $signalStatus = "Downtrend (Below MA20 & MA50)";
+        } elseif ($lastMa20 && $lastMa50 && $lastClose >= $lastMa20 && $lastClose < $lastMa50) {
+            $signalStatus = "Downtrend (Rebound > MA20)";
+        } elseif ($lastMa20 && $lastMa50 && $lastClose < $lastMa20 && $lastClose > $lastMa50) {
+            $signalStatus = "Pullback (< MA20)";
         }
 
-        $maVol20Lot = round(end($maVol20Series));
+        $maVol20Lot  = round(end($maVol20Series));
         $todayVolLot = round($lastCandle['v'] / 100);
-        $volRatio = $maVol20Lot > 0 ? round($todayVolLot / $maVol20Lot, 2) : 1;
+        $rawVolRatio = $maVol20Lot > 0 ? round($todayVolLot / $maVol20Lot, 2) : 1.0;
+        $volRatio    = $rawVolRatio;
+        $volIsProjected = false;
+
+        // Proyeksi Volume Intraday (Run-Rate) khusus BEI 1D saat jam bursa berjalan
+        $tfLabelLow = strtolower((string) ($tfConfig['label'] ?? ''));
+        $tfUnitLow  = strtolower((string) ($tfConfig['unit'] ?? ''));
+        $isDailyTf  = in_array($tfLabelLow, ['1d', 'daily', 'harian'], true)
+                   || in_array($tfUnitLow, ['day', 'd', 'hari'], true);
+
+        if ($isIdx && $isDailyTf && $maVol20Lot > 0 && $todayVolLot > 0) {
+            $nowWib    = \Carbon\Carbon::now('Asia/Jakarta');
+            $candleDay = \Carbon\Carbon::createFromTimestamp((int) $lastCandle['ts'], 'Asia/Jakarta')->format('Y-m-d');
+            if ($nowWib->isWeekday() && $candleDay === $nowWib->format('Y-m-d')) {
+                $minsNow = ($nowWib->hour * 60) + $nowWib->minute;
+                $isFri   = ($nowWib->dayOfWeekIso === 5);
+                $s1Start = 9 * 60;                             // 09:00
+                $s1End   = $isFri ? (11 * 60 + 30) : (12 * 60); // 11:30 / 12:00
+                $s2Start = $isFri ? (14 * 60) : (13 * 60 + 30); // 14:00 / 13:30
+                $s2End   = 16 * 60;                            // 16:00
+                $s1Dur   = $s1End - $s1Start;                  // 150 / 180
+                $totMin  = $s1Dur + ($s2End - $s2Start);       // 270 / 330
+
+                $elapsed = 0;
+                if ($minsNow >= $s1Start && $minsNow < $s2End) {
+                    if ($minsNow <= $s1End) {
+                        $elapsed = $minsNow - $s1Start;
+                    } elseif ($minsNow < $s2Start) {
+                        $elapsed = $s1Dur;
+                    } else {
+                        $elapsed = $s1Dur + ($minsNow - $s2Start);
+                    }
+                }
+
+                if ($elapsed >= 5 && $elapsed < $totMin) {
+                    $effElapsed     = max(15, $elapsed);
+                    $projVolLot     = $todayVolLot * ($totMin / $effElapsed);
+                    $volRatio       = round($projVolLot / $maVol20Lot, 2);
+                    $volIsProjected = true;
+                }
+            }
+        }
+
+        // Sinkronisasi status No Entry untuk header gambar PNG chart
+        $isDowntrendChart = ($lastMa50 && $lastClose < $lastMa50 && (!$lastMa200 || $lastMa50 <= $lastMa200));
+        $isOversoldChart  = ($lastRsi !== null && $lastRsi <= 30);
+        $isNoEntryChart   = ($hasEarlyAcc !== null) && $isDowntrendChart && !$hasEarlyAcc && !$isOversoldChart;
+
+        // Hitung ADTV 20D (Average Daily Trading Value) untuk filter likuiditas BEI
+        $adtvRp = 0.0;
+        if ($isIdx && $maVol20Lot > 0 && $lastClose > 0) {
+            $tfScaleToDay = match (true) {
+                $isDailyTf => 1.0,
+                str_contains($tfLabelLow, 'week') || $tfLabelLow === '1w' => 0.2,
+                str_contains($tfLabelLow, 'month') || $tfLabelLow === '1m' => 0.05,
+                str_contains($tfLabelLow, '1h') || str_contains($tfLabelLow, 'intraday') => 5.5,
+                default => 1.0,
+            };
+            $adtvRp = ($maVol20Lot * 100 * $lastClose) * $tfScaleToDay;
+        }
+        $adtvShort = '';
+        if ($adtvRp >= 1_000_000_000) {
+            $adtvShort = 'Rp ' . number_format($adtvRp / 1_000_000_000, 1, ',', '.') . ' M';
+        } elseif ($adtvRp >= 1_000_000) {
+            $adtvShort = 'Rp ' . number_format($adtvRp / 1_000_000, 0, ',', '.') . ' Jt';
+        } elseif ($adtvRp > 0) {
+            $adtvShort = 'Rp ' . number_format($adtvRp, 0, ',', '.');
+        }
+        $isThinLiquidity = ($isIdx && $adtvRp > 0 && $adtvRp < 5_000_000_000);
+        $highImpactAlloc = ($isIdx && $adtvRp > 0 && $allocRp > ($adtvRp * 0.02));
+
+        $rsVsIhsg = null; $rsLabel = null; $ihsg20dPct = null;
+        if ($isIdx && $isDailyTf && isset($chartCandles) && is_array($chartCandles) && count($chartCandles) >= 21) {
+            $cVals = array_values($chartCandles);
+            $c20   = (float) ($cVals[count($cVals) - 21]['c'] ?? 0);
+            if ($c20 > 0 && $lastClose > 0) {
+                $stock20dPct = round((($lastClose - $c20) / $c20) * 100, 2);
+                $ihsg20dPct  = $this->getIhsg20dReturn();
+                if ($ihsg20dPct !== null) {
+                    $rsVsIhsg = round($stock20dPct - $ihsg20dPct, 1);
+                    $rsLabel  = $rsVsIhsg >= 3.0 ? 'Outperform' : ($rsVsIhsg <= -3.0 ? 'Underperform' : 'Inline');
+                }
+            }
+        }
 
         $metaInfo = [
             'symbol' => str_replace('.JK', '', $symbol),
             'full_symbol' => $symbol,
-            'date' => date($tfConfig['date_fmt'], $lastCandle['ts']),
+            'date' => is_numeric($lastCandle['ts'] ?? null) ? \Carbon\Carbon::createFromTimestamp((int) $lastCandle['ts'], 'Asia/Jakarta')->format($tfConfig['date_fmt']) : (string) ($lastCandle['ts'] ?? ''),
             'tf_label' => $tfConfig['label'],
             'tf_unit' => $tfConfig['unit'],
             'data_source' => $dataSource,
@@ -258,6 +378,19 @@ class StockAnalysisService
             'vol_lot' => $todayVolLot,
             'ma_vol_lot' => $maVol20Lot,
             'vol_ratio' => $volRatio,
+            'vol_ratio_raw' => $rawVolRatio,
+            'vol_is_projected' => $volIsProjected,
+            'is_no_entry' => $isNoEntryChart,
+            'atr14' => $atr14,
+            'atr_pct' => $atrPct,
+            'adtv_rp' => $adtvRp,
+            'adtv_short' => $adtvShort,
+            'is_thin_liquidity' => $isThinLiquidity,
+            'high_impact_alloc' => $highImpactAlloc,
+            'bandar_avg' => ($bandarAvg !== null && $bandarAvg > 0) ? round($bandarAvg, $isIdx ? 0 : 2) : null,
+            'rs_vs_ihsg' => $rsVsIhsg,
+            'rs_label' => $rsLabel,
+            'ihsg_20d_pct' => $ihsg20dPct,
         ];
 
         $chartPath = $this->generateCleanProChart(
@@ -293,6 +426,19 @@ class StockAnalysisService
             'capital_capped' => $metaInfo['capital_capped'] ?? false,
             'signal' => $metaInfo['signal'] ?? '',
             'vol_ratio' => $metaInfo['vol_ratio'] ?? 0,
+            'vol_ratio_raw' => $metaInfo['vol_ratio_raw'] ?? ($metaInfo['vol_ratio'] ?? 0),
+            'vol_is_projected' => $metaInfo['vol_is_projected'] ?? false,
+            'is_no_entry' => $metaInfo['is_no_entry'] ?? false,
+            'atr14' => $metaInfo['atr14'] ?? 0,
+            'atr_pct' => $metaInfo['atr_pct'] ?? 0,
+            'adtv_rp' => $metaInfo['adtv_rp'] ?? 0,
+            'adtv_short' => $metaInfo['adtv_short'] ?? '',
+            'is_thin_liquidity' => $metaInfo['is_thin_liquidity'] ?? false,
+            'high_impact_alloc' => $metaInfo['high_impact_alloc'] ?? false,
+            'bandar_avg' => $metaInfo['bandar_avg'] ?? null,
+            'rs_vs_ihsg' => $metaInfo['rs_vs_ihsg'] ?? null,
+            'rs_label' => $metaInfo['rs_label'] ?? null,
+            'ihsg_20d_pct' => $metaInfo['ihsg_20d_pct'] ?? null,
             'data_source' => $dataSource,
             'last_date' => $metaInfo['date'] ?? '',
             'chart_path' => $chartPath,
@@ -430,6 +576,14 @@ class StockAnalysisService
         $lineR1 = array_map(fn($c) => ['x' => $c['x'], 'y' => $meta['r1']], $candles);
         $lineClose = array_map(fn($c) => ['x' => $c['x'], 'y' => $meta['c']], $candles);
         $lineSL = array_map(fn($c) => ['x' => $c['x'], 'y' => $meta['stoploss']], $candles);
+        $lineS1 = array_map(fn($c) => ['x' => $c['x'], 'y' => $meta['s1']], $candles);
+        $bandarAvgPlot = null;
+        if (!empty($meta['bandar_avg']) && $meta['bandar_avg'] > 0 && !empty($meta['c'])) {
+            $bRatio = $meta['bandar_avg'] / $meta['c'];
+            if ($bRatio >= 0.60 && $bRatio <= 1.40) {
+                $bandarAvgPlot = (float) $meta['bandar_avg'];
+            }
+        }
 
         $chartWidth = 1050;
         $headerHeight = 95;
@@ -478,6 +632,17 @@ class StockAnalysisService
                         'borderColor' => 'rgba(234, 88, 12, 0.65)',
                         'borderWidth' => 1.1,
                         'borderDash' => [5, 5],
+                        'pointRadius' => 0,
+                        'fill' => false,
+                        'yAxisID' => 'yPrice',
+                    ],
+                    [
+                        'type' => 'line',
+                        'label' => 'BoW S1',
+                        'data' => $lineS1,
+                        'borderColor' => 'rgba(22, 163, 74, 0.68)',
+                        'borderWidth' => 1.1,
+                        'borderDash' => [6, 4],
                         'pointRadius' => 0,
                         'fill' => false,
                         'yAxisID' => 'yPrice',
@@ -584,6 +749,20 @@ class StockAnalysisService
             ],
         ];
 
+        if ($bandarAvgPlot !== null) {
+            $lineAvg3 = array_map(fn($c) => ['x' => $c['x'], 'y' => $bandarAvgPlot], $candles);
+            $mainConfig['data']['datasets'][] = [
+                'type' => 'line',
+                'label' => 'Avg3',
+                'data' => $lineAvg3,
+                'borderColor' => 'rgba(8, 145, 178, 0.85)',
+                'borderWidth' => 1.3,
+                'borderDash' => [2, 3],
+                'pointRadius' => 0,
+                'fill' => false,
+                'yAxisID' => 'yPrice',
+            ];
+        }
         $mainRes = Http::timeout(25)
             ->withOptions(['force_ip_resolve' => 'v4'])
             ->post('https://quickchart.io/chart', [
@@ -694,6 +873,7 @@ class StockAnalysisService
         $blue = imagecolorallocate($canvas, 29, 78, 216);
         $purple = imagecolorallocate($canvas, 126, 34, 206);
         $amber = imagecolorallocate($canvas, 180, 83, 9);
+        $teal = imagecolorallocate($canvas, 8, 145, 178);
 
         imagefill($canvas, 0, 0, $white);
 
@@ -726,6 +906,13 @@ class StockAnalysisService
         $this->drawText($canvas, 9, 14, 30, $purple, $ma20Txt, true);
         $this->drawText($canvas, 9, 135, 30, $amber, $ma50Txt, true);
         $this->drawText($canvas, 9, 256, 30, $green, $ma200Txt, true);
+        if (isset($meta['rs_vs_ihsg']) && $meta['rs_vs_ihsg'] !== null) {
+            $rsVal  = (float) $meta['rs_vs_ihsg'];
+            $rsSign = $rsVal >= 0 ? '+' : '';
+            $rsCol  = $rsVal >= 3.0 ? $green : ($rsVal <= -3.0 ? $red : $black);
+            $rsLbl  = (string) ($meta['rs_label'] ?? 'Inline');
+            $this->drawText($canvas, 9, 395, 30, $rsCol, "RS vs IHSG (20D): {$rsLbl} ({$rsSign}{$rsVal}%)", true);
+        }
 
         // Baris 3: Dashboard Sinyal, Target & Stoploss
         $slPct = round((($meta['stoploss'] - $meta['c']) / $meta['c']) * 100, 1);
@@ -733,10 +920,15 @@ class StockAnalysisService
         $line3 = "Dashboard => {$meta['signal']}  |  Target: " . number_format($meta['target1']) . " - " . number_format($meta['target2']) . " (+{$tpPct}%)  |  SL: " . number_format($meta['stoploss']) . " ({$slPct}%)";
         $this->drawText($canvas, 9, 14, 50, $black, $line3, false);
 
-        // Baris 4: Money Management (Dynamic Max Risk)
-        $capTag = !empty($meta['capital_capped']) ? " [Cap Modal]" : "";
-        $line4 = "MM: Max Risk Rp " . number_format($meta['max_risk_rp']) . "  |  Alokasi Dana: Rp " . number_format($meta['alloc_rp']) . "  =>  Rec: " . number_format($meta['rec_lot']) . " Lot" . $capTag;
-        $this->drawText($canvas, 9, 14, 70, $blue, $line4, true);
+        // Baris 4: Money Management (Dynamic Max Risk / No Entry Sync)
+        if (!empty($meta['is_no_entry'])) {
+            $line4 = "MM: Max Risk Rp " . number_format($meta['max_risk_rp']) . "  |  Status: NO ENTRY (Tunda Entry - Tunggu Konfirmasi Tren)";
+            $this->drawText($canvas, 9, 14, 70, $red, $line4, true);
+        } else {
+            $capTag = !empty($meta['capital_capped']) ? " [Cap Modal]" : "";
+            $line4 = "MM: Max Risk Rp " . number_format($meta['max_risk_rp']) . "  |  Alokasi Dana: Rp " . number_format($meta['alloc_rp']) . "  =>  Rec: " . number_format($meta['rec_lot']) . " Lot" . $capTag;
+            $this->drawText($canvas, 9, 14, 70, $blue, $line4, true);
+        }
 
         // Sidebar Kiri: RESISTANCE & SUPPORT
         $yStart = $headerHeight + 16;
@@ -753,10 +945,10 @@ class StockAnalysisService
         $s1Pct = round((($meta['s1'] - $meta['c']) / $meta['c']) * 100, 1);
         $s2Pct = round((($meta['s2'] - $meta['c']) / $meta['c']) * 100, 1);
         $s3Pct = round((($meta['s3'] - $meta['c']) / $meta['c']) * 100, 1);
-        $this->drawText($canvas, 8, 12, $yStart + 92, $black, "S1: " . number_format($meta['s1']) . " ({$s1Pct}%)", false);
-        $this->drawText($canvas, 8, 12, $yStart + 110, $black, "S2: " . number_format($meta['s2']) . " ({$s2Pct}%)", false);
-        $this->drawText($canvas, 8, 12, $yStart + 128, $black, "S3: " . number_format($meta['s3']) . " ({$s3Pct}%)", false);
-        $this->drawText($canvas, 9, 12, $yStart + 148, $green, "SUPPORT", true);
+        $this->drawText($canvas, 9, 12, $yStart + 90, $green, "SUPPORT", true);
+        $this->drawText($canvas, 8, 12, $yStart + 110, $black, "S1: " . number_format($meta['s1']) . " ({$s1Pct}%)", false);
+        $this->drawText($canvas, 8, 12, $yStart + 128, $black, "S2: " . number_format($meta['s2']) . " ({$s2Pct}%)", false);
+        $this->drawText($canvas, 8, 12, $yStart + 146, $black, "S3: " . number_format($meta['s3']) . " ({$s3Pct}%)", false);
 
         // Legend MA & Garis Level di Sidebar Kiri
         imageline($canvas, 12, $yStart + 174, 128, $yStart + 174, $borderCol);
@@ -766,10 +958,16 @@ class StockAnalysisService
         $this->drawText($canvas, 8, 12, $yStart + 235, $black, "— MA Vol20", false);
         $this->drawText($canvas, 8, 12, $yStart + 252, $red, "-- Target R1", false);
         $this->drawText($canvas, 8, 12, $yStart + 269, $orange, "-- Stoploss", false);
+        $this->drawText($canvas, 8, 12, $yStart + 286, $green, "-- BoW (S1)", false);
+        if ($bandarAvgPlot !== null) {
+            $this->drawText($canvas, 8, 12, $yStart + 303, $teal, ".. Avg3 " . number_format($bandarAvgPlot, 0), false);
+        }
 
-        // Bar Info Panel RSI
-        $rsiLine = "{$meta['symbol']} {$meta['tf_label']}  |  RSI(14): {$meta['rsi']}  |  Volume: " . number_format($meta['vol_lot']) .
-                   " Lot  |  MA Vol20: " . number_format($meta['ma_vol_lot']) . " Lot  |  VolRatio: {$meta['vol_ratio']}x";
+        // Bar Info Panel RSI (dengan ATR% & ADTV 20D)
+        $atrPart  = !empty($meta['atr_pct']) ? "  |  ATR: {$meta['atr_pct']}%" : "";
+        $adtvPart = !empty($meta['adtv_short']) ? "  |  ADTV: {$meta['adtv_short']}" : "";
+        $rsiLine  = "{$meta['symbol']} {$meta['tf_label']}  |  RSI(14): {$meta['rsi']}  |  Vol: " . number_format($meta['vol_lot']) .
+                    "  |  MA20: " . number_format($meta['ma_vol_lot']) . " Lot ({$meta['vol_ratio']}x){$atrPart}{$adtvPart}";
         $this->drawText($canvas, 9, 14, $rsiBarY + 6, $blue, $rsiLine, true);
 
         // Border Luar & Garis Pembatas Panel
@@ -1076,6 +1274,41 @@ class StockAnalysisService
         }
     }
 
+
+    private function getIhsg20dReturn(): ?float
+    {
+        return \Illuminate\Support\Facades\Cache::remember('ihsg_20d_return_v1', 900, function () {
+            try {
+                $sb = $this->fetchStockbitChartResult('IHSG', '1D');
+                $closes = [];
+                if ($sb && !empty($sb['indicators']['quote'][0]['close'])) {
+                    foreach ($sb['indicators']['quote'][0]['close'] as $c) {
+                        if (is_numeric($c) && $c > 0) $closes[] = (float) $c;
+                    }
+                }
+                if (count($closes) < 21) {
+                    $resp = Http::timeout(10)
+                        ->withOptions(['force_ip_resolve' => 'v4'])
+                        ->withHeaders(['User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'])
+                        ->get('https://query1.finance.yahoo.com/v8/finance/chart/%5EJKSE?range=3mo&interval=1d');
+                    if ($resp->successful()) {
+                        $closes = [];
+                        foreach (($resp->json('chart.result.0.indicators.quote.0.close') ?? []) as $c) {
+                            if (is_numeric($c) && $c > 0) $closes[] = (float) $c;
+                        }
+                    }
+                }
+                if (count($closes) >= 21) {
+                    $last = $closes[count($closes) - 1];
+                    $prev = $closes[count($closes) - 21];
+                    return $prev > 0 ? round((($last - $prev) / $prev) * 100, 2) : null;
+                }
+            } catch (\Throwable $e) {
+                return null;
+            }
+            return null;
+        });
+    }
 
     private function fetchStockbitChartResult(string $cleanSymbol, string $tf): ?array
     {
