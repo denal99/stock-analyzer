@@ -139,7 +139,13 @@ class MarketSessionReportService
             ? $activeTradeDate
             : $this->resolvePreviousTradeDate($activeTradeDate);
 
-        $topForeignBuy = $this->fetchTopInvestorNetBuy($token, $activeSymbols, $activeTradeDate, 'INVESTOR_TYPE_FOREIGN', $records);
+        $foreignTradeDate = $activeTradeDate;
+        $topForeignBuy = $this->fetchMotionTradeForeignBuy($todayStr, $records);
+        if (!empty($topForeignBuy)) {
+            $foreignTradeDate = $todayStr;
+        } else {
+            $topForeignBuy = $this->fetchTopInvestorNetBuy($token, $activeSymbols, $activeTradeDate, 'INVESTOR_TYPE_FOREIGN', $records);
+        }
         $topLocalBuy   = $this->fetchTopInvestorNetBuy($token, $activeSymbols, $activeTradeDate, 'INVESTOR_TYPE_DOMESTIC', $records);
         $foreignFollow = $this->fetchForeignFollowThrough($token, $sortedByChange, $followTradeDate);
 
@@ -152,7 +158,7 @@ class MarketSessionReportService
             $topLosers,
             $topForeignBuy,
             $topLocalBuy,
-            $activeTradeDate,
+            $foreignTradeDate,
             $foreignFollow,
             $rebound3d,
             $volSpikes,
@@ -706,5 +712,87 @@ class MarketSessionReportService
         }
 
         return $rowCount > 0 ? $keyboard : null;
+    }
+
+    private function fetchMotionTradeForeignBuy(string $dateYmd, array $records): array
+    {
+        try {
+            $dt = \Carbon\Carbon::parse($dateYmd);
+            $yymmdd = $dt->format('ymd');
+            $fiUrl = "https://www.motiontrade.id/DTB/{$yymmdd}/FI{$yymmdd}.TXT";
+            $maUrl = "https://www.motiontrade.id/DTB/{$yymmdd}/MA{$yymmdd}.TXT";
+
+            $responses = Http::pool(fn($pool) => [
+                $pool->as('fi')->connectTimeout(4)->timeout(8)->get($fiUrl),
+                $pool->as('ma')->connectTimeout(4)->timeout(8)->get($maUrl),
+            ]);
+
+            $fiRes = $responses['fi'] ?? null;
+            if (!$fiRes || $fiRes instanceof \Throwable || $fiRes->failed()) {
+                return [];
+            }
+
+            $fiBody = (string) $fiRes->body();
+            if (trim($fiBody) === '' || stripos($fiBody, 'Foreign Buy') === false) {
+                return [];
+            }
+
+            $priceMap = [];
+            foreach ($records as $sym => $rec) {
+                $priceMap[strtoupper((string) $sym)] = [
+                    'close'      => (float) ($rec['close'] ?? 0),
+                    'change_pct' => (float) ($rec['change_pct'] ?? 0),
+                ];
+            }
+
+            $maRes = $responses['ma'] ?? null;
+            if ($maRes && !($maRes instanceof \Throwable) && $maRes->successful()) {
+                foreach (preg_split("/\r\n|\n|\r/", (string) $maRes->body()) as $line) {
+                    if (preg_match('/^\s*\d+\s+([A-Z]{4})\s+.+?\s+([\d,]+)\s+([\d,]+)\s+([+-]?[\d,]+)\s+([+-]?\d+\.\d+)\s+[\d,]+\s+[\d,]+\s+[\d,]+\s+\d+\s*$/', $line, $m)) {
+                        $sym = $m[1];
+                        if (!isset($priceMap[$sym]) || $priceMap[$sym]['close'] <= 0) {
+                            $priceMap[$sym] = [
+                                'close'      => (float) str_replace(',', '', $m[3]),
+                                'change_pct' => (float) $m[5],
+                            ];
+                        }
+                    }
+                }
+            }
+
+            $results = [];
+            foreach (preg_split("/\r\n|\n|\r/", $fiBody) as $line) {
+                if (!preg_match('/^\s*\d+\s+([A-Z]{4})\s+.+?\s+\d+\s+[\d,]+\s+([+-]?[\d,]+)\s+([\d,]+)\s+([\d,]+)\s*$/', $line, $m)) {
+                    continue;
+                }
+
+                $sym       = $m[1];
+                $netShares = (float) str_replace(',', '', $m[2]);
+                if ($netShares <= 0) {
+                    continue;
+                }
+
+                $close     = $priceMap[$sym]['close'] ?? 0.0;
+                $changePct = $priceMap[$sym]['change_pct'] ?? 0.0;
+
+                if ($close <= 0) {
+                    continue;
+                }
+
+                $netIdr = $netShares * $close;
+                if ($netIdr >= 50_000_000) {
+                    $results[$sym] = [
+                        'symbol'     => $sym,
+                        'net_b'      => round($netIdr / 1_000_000_000, 2),
+                        'change_pct' => round($changePct, 2),
+                    ];
+                }
+            }
+
+            uasort($results, fn($a, $b) => $b['net_b'] <=> $a['net_b']);
+            return array_slice($results, 0, 5, true);
+        } catch (\Throwable $e) {
+            return [];
+        }
     }
 }
